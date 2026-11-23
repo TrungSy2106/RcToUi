@@ -459,6 +459,7 @@ def parse_project(path, include_dirs=(), defines=(), undefines=(), encoding=None
     resources=parser.parse()
     metadata={"project_root":str(parser.pp.files.root),"dependencies":sorted(parser.pp.files.opened),
               "builtin_headers":parser.pp.builtin_headers,"resolved_paths":parser.pp.files.discovered,
-              "conditions":parser.pp.conditions,"resource_origins":parser.origins,"unparsed_resources":parser.unparsed}
+              "conditions":parser.pp.conditions,"encodings":parser.pp.encodings,
+              "resource_origins":parser.origins,"unparsed_resources":parser.unparsed}
     metadata["errors"]=[item for item in parser.pp.warnings if item["severity"]=="error"]
     return resources,parser.pp.symbols(),parser.pp.warnings,metadata

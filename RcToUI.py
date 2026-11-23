@@ -7,6 +7,8 @@ Requires Python 3.9+ and only the standard library; no Windows SDK is needed.
 Automatically resolves project headers, images, Ribbon XML and included RC files.
 Exports Dialog/Menu/Toolbar/Ribbon to .ui, images to .qrc, and strings to .ts.
 Default output: <input_stem>_qt/ beside the source, or the directory set by -o.
+Compatible LANGUAGE variants share a .ui and Qt .ts catalogs automatically.
+Use --separate-languages to retain the original per-language UI output.
 """
 
 import argparse
@@ -54,6 +56,8 @@ def main(argv=None):
     parser.add_argument("-U", "--undefine", action="append", default=[], help="undefine a predefined macro")
     parser.add_argument("--scale", type=float, help="explicit uniform DLU scale; default: Windows font metrics at 96 DPI")
     parser.add_argument("--language", type=lambda value: int(value, 0), help="filter language ID, e.g. 0x409")
+    parser.add_argument("--source-language", type=lambda value: int(value, 0), help="preferred base language for shared UI/translations, e.g. 0x409")
+    parser.add_argument("--separate-languages", action="store_true", help="keep separate UI files per language instead of merging compatible forms")
     parser.add_argument("--strict", action="store_true", help="fail before writing if any conversion warning exists")
     parser.add_argument("--widget-map", action="append", default=[], metavar="NATIVE=QT", help="explicit native class to built-in Qt widget mapping")
     parser.add_argument("--dlginit-encoding", help="encoding of ANSI strings in MFC DLGINIT")
@@ -64,6 +68,7 @@ def main(argv=None):
         paths = convert(args.rc, output_dir=args.output_dir, encoding=args.encoding,
                         include_dirs=args.include, defines=args.define, undefines=args.undefine,
                         scale=args.scale, language=args.language, strict=args.strict,
+                        source_language=args.source_language, separate_languages=args.separate_languages,
                         widget_map=args.widget_map, dlginit_encoding=args.dlginit_encoding,
                         ribbon_resources=args.ribbon_resources, ribbon_target=args.ribbon_target)
         for path in paths:

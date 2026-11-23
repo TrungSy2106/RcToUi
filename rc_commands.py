@@ -403,10 +403,11 @@ class CommandResources:
         self.dialog_bindings.append({"dialog": dialog.identifier, "language": dialog.language,
                                      "menu": dialog.menu, "actions": builder.action_report()})
 
-    def export_strings(self, stem):
+    def export_strings(self, stem, source_language=None):
         if not self.strings:
             return {}
-        source_language = 0x409 if 0x409 in self.strings else 0 if 0 in self.strings else min(self.strings)
+        from rc_i18n import preferred_language
+        source_language = preferred_language(self.strings, source_language)
         identifier_names = {identifier: self.name_for(identifier, "IDS_")
                             for values in self.strings.values() for identifier in values}
         source = {}

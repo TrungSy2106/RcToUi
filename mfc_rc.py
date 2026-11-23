@@ -725,12 +725,14 @@ def organize_ui_outputs(outputs, dialogs, forms, qrc_name):
 def convert_mfc(rc_path, output_dir=None, encoding=None, *,
                 include_dirs=(), defines=(), undefines=(), scale=None, language=None,
                 strict=False, widget_map=(), dlginit_encoding=None,
-                ribbon_resources=None, ribbon_target=None):
+                ribbon_resources=None, ribbon_target=None, source_language=None, separate_languages=False):
     path = Path(rc_path).resolve()
     if scale is not None and (not math.isfinite(scale) or scale <= 0):
         raise ConversionError("--scale must be a positive finite number")
     if language is not None and not 0 <= language <= 0xFFFF:
         raise ConversionError("--language must fit in 16 bits")
+    if source_language is not None and not 0 <= source_language <= 0xFFFF:
+        raise ConversionError("--source-language must fit in 16 bits")
     if path.suffix.lower() not in {".rc", ".rc2", ".mfcribbon-ms"}:
         raise ConversionError(f"unsupported input {path.suffix!r}; expected .rc, .rc2 or .mfcribbon-ms")
     overrides = {}
@@ -870,8 +872,18 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
     active_resource=None
     outputs.update(commands.export_frames(outputs))
     ui_names = organize_ui_outputs(outputs,report_dialogs,commands.forms,assets.qrc_name)
-    string_outputs = {"strings/"+name:data for name,data in commands.export_strings(path.stem).items()}
+    string_outputs = {"strings/"+name:data for name,data in commands.export_strings(path.stem, source_language).items()}
     outputs.update(string_outputs)
+    from rc_i18n import merge_ui_languages
+    translations = merge_ui_languages(outputs, report_dialogs, commands, assets, path.stem,
+                                     separate=separate_languages, source_language=source_language)
+    ui_names = list(dict.fromkeys(record["file"] for record in report_dialogs + commands.forms))
+    for variant in translations["separate_forms"]:
+        origin = next((o for o in origins if o["name"] == variant["resource"] and o["language"] == variant["language"]
+                       and (o["type"] == 5 if variant["kind"] == "dialog" else o["type"] in {4,9,28,241})), {})
+        warnings.append(diagnostic("warning", "I18N_VARIANT", origin.get("file",path), origin.get("line",1),
+                                   variant["resource"], origin.get("type",variant["kind"]),
+                                   f"Language {variant['language']:#06x} stays in {variant['file']}: {variant['reason']}"))
     outside = sorted({str(item.type) for item in resources if item.type not in {0, 2, 3, 4, 5, 6, 9, 14, 240, 241}
                       and not is_ribbon(item) and (item.type, item.name, item.language) not in ribbons.used_images})
     if outside:
@@ -882,6 +894,7 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
     report = {"source": str(path), "backend": "python-rc" if source_metadata is not None else "ribbon-xml", "dialogs": report_dialogs,
               "command_forms": commands.forms, "dialog_menus": commands.dialog_bindings,
               "converted_command_resources": commands.decoded, "string_files": list(string_outputs),
+              "translations": translations,
               "warnings": warnings, "notes": ["MFC C++ event handlers, DDX/DDV, models and dynamic layout are not stored in RC and must be ported separately.",
                                                "Command resources sharing an ID are grouped in a QMainWindow. Different resource IDs are exported separately because RC does not record their runtime association.",
                                                "Connect the primary QAction for each command ID; alternate menu labels and extra shortcuts forward trigger() to that action.",

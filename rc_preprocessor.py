@@ -1,4 +1,8 @@
-"""Project-local RC preprocessing, with no compiler, shell, SDK or eval()."""
+"""Project-local RC preprocessing, with no compiler, shell, SDK or eval().
+
+Byte files follow active code_page directives. A Unicode BOM or --encoding
+fixes the physical source encoding; pragmas still control narrow byte escapes.
+"""
 
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -23,6 +27,32 @@ class Token:
 
 PATTERN = re.compile(STRING.pattern + r"|(?:L)?'(?:[^'\\]|\\.)*'|0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*|[^\W\d]\w*|\$\w+|\.\.\.|##|<<|>>|&&|\|\||<=|>=|==|!=|[^\s]", re.UNICODE)
 IDENT = re.compile(r"^[^\W\d]\w*$", re.UNICODE)
+COMMENT_OR_LITERAL = re.compile(STRING.pattern + r"|(?:L)?'(?:[^'\\]|\\.)*'|//.*|/\*")
+
+
+def strip_comments(value, in_comment=False):
+    """Strip comments from a decoded logical line, retaining literal contents."""
+    result, position = [], 0
+    while position < len(value):
+        if in_comment:
+            end = value.find("*/", position)
+            if end < 0:
+                result.append(" " * (len(value) - position))
+                break
+            result.append(" " * (end + 2 - position))
+            position, in_comment = end + 2, False
+            continue
+        match = COMMENT_OR_LITERAL.search(value, position)
+        if match is None:
+            result.append(value[position:])
+            break
+        result.append(value[position:match.start()])
+        token = match[0]
+        result.append(" " * len(token) if token.startswith(("//", "/*")) else token)
+        position = match.end()
+        if token == "/*":
+            in_comment = True
+    return "".join(result), in_comment
 
 
 def lex(value, path="<expression>", line=1, encoding="cp1252"):
@@ -284,7 +314,7 @@ class Preprocessor:
     def __init__(self, entry, include_dirs=(), defines=(), undefines=(), encoding=None):
         self.files=ProjectFiles(entry,include_dirs);self.encoding=encoding
         self.macros={name:Macro(lex("1")) for name in ("RC_INVOKED","_WIN32","WIN32")};self.once=set();self.stack=[]
-        self.warnings=[];self.builtin_headers=[];self.conditions=[];self.used_ids={}
+        self.warnings=[];self.builtin_headers=[];self.conditions=[];self.used_ids={};self.encodings=[]
         for value in defines:
             name,separator,body=value.partition("=");self.define(name+" "+(body if separator else "1"),"<command line>",1)
         for value in undefines:self.macros.pop(value,None)
@@ -293,7 +323,7 @@ class Preprocessor:
         path,line=location
         self.warnings.append(diagnostic(severity,code,path,line,resource_id,resource_type,message))
 
-    def define(self, declaration, path, line):
+    def define(self, declaration, path, line, encoding="cp1252"):
         match=re.match(r"([^\W\d]\w*)(.*)$",declaration,re.S)
         if not match:raise ConversionError("invalid #define")
         name,tail=match.groups();parameters=None;variadic=False
@@ -304,7 +334,7 @@ class Preprocessor:
             if parameters and parameters[-1]=="...":parameters[-1]="__VA_ARGS__";variadic=True
             if any(not IDENT.fullmatch(item) for item in parameters):raise ConversionError("unsupported macro parameter declaration")
             tail=tail[end+1:]
-        self.macros[name]=Macro(lex(tail.strip(),path,line),parameters,variadic)
+        self.macros[name]=Macro(lex(tail.strip(),path,line,encoding),parameters,variadic)
 
     def expand(self, tokens, depth=0):
         if depth>100:raise ConversionError("macro nesting exceeds 100")
@@ -365,8 +395,8 @@ class Preprocessor:
 
     def integer(self, tokens, undefined_zero=False):return Expression(self.expand(tokens),undefined_zero).evaluate()
 
-    def condition(self, value, path, line):
-        tokens=lex(value,path,line);result=[];index=0
+    def condition(self, value, path, line, encoding="cp1252"):
+        tokens=lex(value,path,line,encoding);result=[];index=0
         while index<len(tokens):
             token=tokens[index]
             if token.text!="defined":result.append(token);index+=1;continue
@@ -389,7 +419,7 @@ class Preprocessor:
             if declaration.split("(",1)[0] not in self.macros:self.define(declaration,"<builtin "+name+">",1)
         if name not in self.builtin_headers:self.builtin_headers.append(name)
 
-    def read(self, path):
+    def read(self, path, inherited_codec=None):
         path=Path(path).resolve()
         if path in self.once:return []
         if len(self.stack)>100:raise ConversionError("include nesting exceeds 100")
@@ -399,46 +429,62 @@ class Preprocessor:
         self.stack.append(path);self.files.opened.add(str(path))
         try:
             raw=path.read_bytes()
-            if raw.startswith((codecs.BOM_UTF16_LE,codecs.BOM_UTF16_BE)):content=raw.decode("utf-16");codec="cp1252"
-            elif raw.startswith(codecs.BOM_UTF8):content=raw.decode("utf-8-sig");codec="utf-8"
+            source_encoding=None
+            if raw.startswith((codecs.BOM_UTF16_LE,codecs.BOM_UTF16_BE)):
+                content,codec,origin=raw.decode("utf-16"),"cp1252","bom"
+                source_encoding="utf-16"
+            elif raw.startswith(codecs.BOM_UTF8):
+                content,codec,origin=raw.decode("utf-8-sig"),"utf-8","bom"
+                source_encoding="utf-8-sig"
+            elif self.encoding:
+                content=raw.decode(self.encoding)
+                codec="cp1252" if codecs.lookup(self.encoding).name.startswith(("utf-16","utf-32")) else self.encoding
+                origin="override"
+                source_encoding=self.encoding
             else:
-                pages=re.findall(rb"#\s*pragma\s+code_page\s*\(\s*(\d+)\s*\)",raw)
-                if len(set(pages))>1 and not raw.isascii() and not self.encoding:
-                    raise ConversionError("mixed byte code pages in one RC file cannot be decoded safely; save it as UTF-8 with BOM/UTF-16, split language files, or pass --encoding for a uniform source encoding")
-                pragma=pages[0] if pages else None
-                codec=self.encoding or ("cp"+pragma.decode() if pragma else "utf-8")
-                try:content=raw.decode(codec)
+                content,codec,origin=raw,inherited_codec or "cp1252","inherited" if inherited_codec else "default"
+                try:raw.decode("utf-8")
                 except UnicodeDecodeError:
-                    if self.encoding or pragma:raise
-                    codec="cp1252";content=raw.decode(codec)
-                    self.warn("RC_ENCODING",(path,1),"no BOM/code_page; interpreted legacy bytes as cp1252; override with --encoding")
-                if raw.isascii() and not self.encoding and not pragma:codec="cp1252"
-            # C translation splices backslash-newline before recognizing
-            # comments (a continued // comment must hide the following line).
-            logical_source=[];pending="";start=1;continuing=False
-            physical_lines=content.replace("\r\n","\n").split("\n")
-            for physical,value in enumerate(physical_lines,1):
-                if not continuing:start=physical
-                if physical<len(physical_lines) and value.endswith("\\"):
-                    pending+=value[:-1];continuing=True;continue
-                logical_source.append((start,pending+value));pending="";continuing=False
-            content="\n".join(value for _,value in logical_source)
-            # Preserve logical line counts while removing comments outside literals.
-            pattern=re.compile(STRING.pattern+r"|(?:L)?'(?:[^'\\]|\\.)*'|//[^\n]*|/\*[\s\S]*?\*/")
-            content=pattern.sub(lambda m:"".join("\n" if c=="\n" else " " for c in m[0]) if m[0].startswith(("//","/*")) else m[0],content)
-            for match in re.finditer(STRING.pattern+r"|(?:L)?'(?:[^'\\]|\\.)*'|/\*",content):
-                if match[0]=="/*":raise ConversionError(f"{path}: unterminated block comment")
-            logical=[(logical_source[index][0],value) for index,value in enumerate(content.split("\n"))]
+                    if not inherited_codec and not re.search(rb"#\s*pragma\s+code_page\s*\(",raw):
+                        self.warn("RC_ENCODING",(path,1),"no BOM/code_page; interpreted legacy bytes as cp1252; override with --encoding")
+                else:
+                    if not inherited_codec and not raw.isascii():codec,origin="utf-8","detected_utf8"
+            default_codec=codec if self.encoding else "cp1252"
+            fixed_source=isinstance(content,str)
+            self.encodings.append({"file":str(path),"line":1,"encoding":codec,"origin":origin,
+                                   "source_encoding":source_encoding or codec})
+
+            def logical_lines():
+                # Decode before splicing: a DBCS trail byte 0x5c is not '\\'.
+                # The generator resumes after each directive updates codec.
+                separator="\n" if fixed_source else b"\n"
+                physical_lines=content.split(separator)
+                pending="";start=1;continuing=False;in_comment=False;comment_line=1
+                for physical,value in enumerate(physical_lines,1):
+                    if not fixed_source:value=value.decode(codec,errors="surrogateescape")
+                    value=value.removesuffix("\r")
+                    if not continuing:start=physical
+                    if physical<len(physical_lines) and value.endswith("\\"):
+                        pending+=value[:-1];continuing=True;continue
+                    value=pending+value;pending="";continuing=False
+                    value,open_comment=strip_comments(value,in_comment)
+                    if open_comment and not in_comment:comment_line=start
+                    in_comment=open_comment
+                    yield start,value
+                if in_comment:raise ConversionError(f"{path}:{comment_line}: unterminated block comment")
+
             output=[];buffer=[];conditions=[];active=True;header=path.suffix.lower() in {".h",".hpp",".c"}
             def flush():
                 output.extend(self.expand(buffer));buffer.clear()
-            for line,value in logical:
+            for line,value in logical_lines():
+                if active and re.search(r"[\udc80-\udcff]",value):
+                    raise ConversionError(f"{path}:{line}: cannot decode source bytes using {codec}; check #pragma code_page or pass --encoding for a uniformly encoded file")
                 directive=re.match(r"\s*#\s*(\w+)(.*)",value,re.S)
                 if directive:
                     flush()
                     command,argument=directive[1].lower(),directive[2].strip()
                     if command in {"if","ifdef","ifndef"}:
-                        chosen=(self.condition(argument,path,line) if command=="if" else (argument in self.macros) != (command=="ifndef")) if active else False
+                        chosen=(self.condition(argument,path,line,codec) if command=="if" else (argument in self.macros) != (command=="ifndef")) if active else False
                         if command!="if":self.conditions.append({"file":str(path),"line":line,"expression":command+" "+argument,"result":bool(active and chosen)})
                         conditions.append([active,chosen,False]);active=active and chosen;continue
                     if command in {"else","elif","endif"}:
@@ -446,17 +492,21 @@ class Preprocessor:
                         parent,taken,saw_else=conditions[-1]
                         if command=="endif":conditions.pop();active=parent;continue
                         if saw_else:raise ConversionError(f"{path}:{line}: directive after #else")
-                        chosen=not taken and parent and (self.condition(argument,path,line) if command=="elif" else True)
+                        chosen=not taken and parent and (self.condition(argument,path,line,codec) if command=="elif" else True)
                         conditions[-1]=[parent,taken or chosen,command=="else"];active=chosen;continue
                     if not active:continue
-                    if command=="define":self.define(argument,path,line)
+                    if command=="define":self.define(argument,path,line,codec)
                     elif command=="undef":self.macros.pop(argument,None)
-                    elif command=="include":output.extend(self.include(argument,path,line))
+                    elif command=="include":output.extend(self.include(argument,path,line,codec))
                     elif command=="pragma":
                         if argument=="once":self.once.add(path)
                         elif re.match(r"code_page\s*\(",argument):
-                            match=re.fullmatch(r"code_page\s*\(\s*(\d+)\s*\)",argument)
-                            if match:codec="cp"+match[1];codecs.lookup(codec)
+                            match=re.fullmatch(r"code_page\s*\(\s*(\d+|DEFAULT)\s*\)",argument,re.I)
+                            if match:
+                                codec=default_codec if match[1].upper()=="DEFAULT" else "cp"+match[1]
+                                codecs.lookup(codec)
+                                self.encodings.append({"file":str(path),"line":line,"encoding":codec,"origin":"pragma",
+                                                       "source_encoding":source_encoding or codec})
                             else:self.warn("PP_PRAGMA",(path,line),"cannot parse #pragma "+argument)
                         elif not argument.startswith(("warning","pack","message")):self.warn("PP_PRAGMA",(path,line),"unsupported #pragma "+argument)
                     elif command in {"line"}:pass
@@ -466,7 +516,7 @@ class Preprocessor:
                     continue
                 if not active or header or not value.strip():continue
                 rcinclude=re.match(r"\s*RCINCLUDE\s+(.+)",value,re.I)
-                if rcinclude:flush();output.extend(self.include(rcinclude[1],path,line));continue
+                if rcinclude:flush();output.extend(self.include(rcinclude[1],path,line,codec));continue
                 tokens=lex(value,path,line,codec)
                 for candidate in {t.text for t in tokens if t.kind=="id" and t.text.startswith("ID")}:
                     macro=self.macros.get(candidate)
@@ -484,8 +534,8 @@ class Preprocessor:
             raise ConversionError(f"{path}:{locals().get('line',1)}: {exc}") from exc
         finally:self.stack.pop()
 
-    def include(self, value, path, line):
-        expanded=self.expand(lex(value,path,line));spelling="".join(t.text for t in expanded)
+    def include(self, value, path, line, encoding="cp1252"):
+        expanded=self.expand(lex(value,path,line,encoding));spelling="".join(t.text for t in expanded)
         if spelling.startswith('"'):
             name=rc_text(expanded)
         elif spelling.startswith("<") and spelling.endswith(">"):
@@ -497,7 +547,7 @@ class Preprocessor:
             if basename in self.BUILTIN_HEADERS and str(exc).startswith("file not found in project:"):
                 self.builtin(basename);return []
             self.warn("PP_INCLUDE",(path,line),str(exc),severity="error",resource_id=name,resource_type="INCLUDE");return []
-        return self.read(resolved)
+        return self.read(resolved,encoding)
 
     def symbols(self):
         result={value:sorted(names) for value,names in self.used_ids.items()}
