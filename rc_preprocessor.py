@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import codecs
 import os
+import operator as ops
 import re
 import xml.etree.ElementTree as ET
 
@@ -127,6 +128,10 @@ class Integer:
 class Expression:
     PRECEDENCE = {"||":1,"&&":2,"|":3,"^":4,"&":5,"==":6,"!=":6,"<":7,"<=":7,">":7,">=":7,"<<":8,">>":8,"+":9,"-":9,"*":10,"/":10,"%":10}
     TYPES = {"int", "long", "short", "char", "unsigned", "signed", "DWORD", "WORD", "BYTE", "UINT", "INT", "LONG", "ULONG", "DWORD_PTR", "UINT_PTR", "LPARAM", "WPARAM", "BOOL"}
+    ARITHMETIC = {"+": ops.add, "-": ops.sub, "*": ops.mul,
+                  "|": ops.or_, "&": ops.and_, "^": ops.xor}
+    COMPARISONS = {"==": ops.eq, "!=": ops.ne, "<": ops.lt,
+                   "<=": ops.le, ">": ops.gt, ">=": ops.ge}
 
     def __init__(self, tokens, undefined_zero=False):
         self.tokens = tokens; self.pos = 0; self.undefined_zero = undefined_zero
@@ -135,6 +140,55 @@ class Expression:
     def take(self):
         if self.pos >= len(self.tokens): raise ConversionError("incomplete integer expression")
         token=self.tokens[self.pos]; self.pos+=1; return token
+
+    @staticmethod
+    def literal(value):
+        match = re.fullmatch(r"(0[xX][0-9a-fA-F]+|\d+)([uUlL]*)", value)
+        if not match:
+            raise ConversionError(f"unsupported integer literal {value!r}")
+        digits, suffix = match.groups()
+        suffix = suffix.lower()
+        if digits.lower().startswith("0x"):
+            base = 16
+        elif digits.startswith("0") and len(digits) > 1:
+            base = 8
+        else:
+            base = 10
+        number = int(digits, base)
+        if number > 0xffffffffffffffff:
+            raise ConversionError("integer literal exceeds 64 bits")
+        wide_decimal = base == 10 and "u" not in suffix and number > 0x7fffffff
+        bits = 64 if suffix.count("l") > 1 or number > 0xffffffff or wide_decimal else 32
+        unsigned = "u" in suffix or base != 10 and number >= 1 << (bits - 1)
+        return Integer(number, bits, unsigned)
+
+    @staticmethod
+    def cast_type(names):
+        if any(name in {"BYTE", "char"} for name in names):
+            bits = 8
+        elif any(name in {"WORD", "short"} for name in names):
+            bits = 16
+        elif names.count("long") > 1 or any(name in {"DWORD_PTR", "UINT_PTR", "LPARAM", "WPARAM"} for name in names):
+            bits = 64
+        else:
+            bits = 32
+        unsigned = "unsigned" in names or any(name in {"DWORD", "WORD", "BYTE", "UINT", "ULONG", "DWORD_PTR", "UINT_PTR", "WPARAM"} for name in names)
+        return bits, unsigned
+
+    @staticmethod
+    def common_type(left, right):
+        """Apply C integer promotions, then select the common operand type."""
+        left_bits, left_unsigned = left
+        right_bits, right_unsigned = right
+        if left_bits < 32:
+            left_bits, left_unsigned = 32, False
+        if right_bits < 32:
+            right_bits, right_unsigned = 32, False
+        if left_bits > right_bits:
+            return left_bits, left_unsigned
+        if right_bits > left_bits:
+            return right_bits, right_unsigned
+        return left_bits, left_unsigned or right_unsigned
 
     def node(self, minimum=0):
         token = self.take(); value = token.text
@@ -150,15 +204,7 @@ class Expression:
                 self.pos=start; left=self.node()
                 if self.take().text != ")": raise ConversionError("unbalanced expression parentheses")
         elif token.kind == "number":
-            match = re.fullmatch(r"(0[xX][0-9a-fA-F]+|\d+)([uUlL]*)",value)
-            if not match: raise ConversionError(f"unsupported integer literal {value!r}")
-            digits,suffix=match.groups()
-            number=int(digits,16) if digits.lower().startswith("0x") else int(digits,8) if digits.startswith("0") and len(digits)>1 else int(digits)
-            hexadecimal=digits.lower().startswith("0x") or len(digits)>1 and digits.startswith("0")
-            bits=64 if suffix.lower().count("l")>1 or number>0xffffffff or not hexadecimal and "u" not in suffix.lower() and number>0x7fffffff else 32
-            unsigned="u" in suffix.lower() or hexadecimal and number>=(1<<(bits-1))
-            if number>0xffffffffffffffff:raise ConversionError("integer literal exceeds 64 bits")
-            left=("literal",Integer(number,bits,unsigned))
+            left = ("literal", self.literal(value))
         elif token.kind == "char":
             decoded=rc_text([token])
             if len(decoded)!=1: raise ConversionError("multi-character C character constants are unsupported")
@@ -187,10 +233,11 @@ class Expression:
         if kind=="literal": return node[1]
         if kind=="ternary":
             bits,unsigned=self.result_type(node)
-            return self.compute(node[2] if self.compute(node[1]).value else node[3]).cast(bits,unsigned)
+            branch = node[2] if self.compute(node[1]).value else node[3]
+            return self.compute(branch).cast(bits,unsigned)
         if kind=="cast":
-            names=node[1]; bits=8 if any(x in {"BYTE","char"} for x in names) else 16 if any(x in {"WORD","short"} for x in names) else 64 if names.count("long")>1 or any(x in {"DWORD_PTR","UINT_PTR","LPARAM","WPARAM"} for x in names) else 32
-            return self.compute(node[2]).cast(bits,"unsigned" in names or any(x in {"DWORD","WORD","BYTE","UINT","ULONG","DWORD_PTR","UINT_PTR","WPARAM"} for x in names))
+            bits, unsigned = self.cast_type(node[1])
+            return self.compute(node[2]).cast(bits, unsigned)
         if kind=="unary":
             operator=node[1];value=self.compute(node[2])
             if value.bits<32:value=Integer(value.value)
@@ -208,17 +255,16 @@ class Expression:
             if not 0<=right.value<64:raise ConversionError("invalid C shift count")
             value=left.value<<right.value if operator=="<<" else left.value>>right.value
             return Integer(value,left.bits,left.unsigned).cast(left.bits,left.unsigned)
-        bits=max(left.bits,right.bits)
-        unsigned=left.unsigned if left.bits>right.bits else right.unsigned if right.bits>left.bits else left.unsigned or right.unsigned
+        bits, unsigned = self.common_type((left.bits, left.unsigned), (right.bits, right.unsigned))
         a,b=left.cast(bits,unsigned).value,right.cast(bits,unsigned).value
-        if operator in {"==","!=","<","<=",">",">="}:
-            return Integer(int({"==":a==b,"!=":a!=b,"<":a<b,"<=":a<=b,">":a>b,">=":a>=b}[operator]))
+        if operator in self.COMPARISONS:
+            return Integer(int(self.COMPARISONS[operator](a, b)))
         if operator in {"/","%"}:
             if not b:raise ConversionError("division by zero in integer expression")
             quotient=abs(a)//abs(b)*(-1 if (a<0)!=(b<0) else 1)
             value=quotient if operator=="/" else a-quotient*b
         else:
-            value={"+":lambda:a+b,"-":lambda:a-b,"*":lambda:a*b,"|":lambda:a|b,"&":lambda:a&b,"^":lambda:a^b}[operator]()
+            value = self.ARITHMETIC[operator](a, b)
         return Integer(value,bits,unsigned).cast(bits,unsigned)
 
     def result_type(self,node):
@@ -226,19 +272,18 @@ class Expression:
         kind=node[0]
         if kind=="literal":return node[1].bits,node[1].unsigned
         if kind=="cast":
-            # Cast the type only; the operand may contain an unevaluated 1/0.
-            value=self.compute(("cast",node[1],("literal",Integer(0))))
-            return value.bits,value.unsigned
+            return self.cast_type(node[1])
         if kind=="unary":
             if node[1]=="!":return 32,False
-            bits,unsigned=self.result_type(node[2]);return (32,False) if bits<32 else (bits,unsigned)
+            bits,unsigned=self.result_type(node[2])
+            if bits < 32:
+                return 32, False
+            return bits, unsigned
         if kind=="binary" and node[1] in {"&&","||","==","!=","<","<=",">",">="}:return 32,False
-        left,right=node[2],node[3]
-        a,ua=self.result_type(left);b,ub=self.result_type(right)
-        if a<32:a,ua=32,False
-        if b<32:b,ub=32,False
-        if kind=="binary" and node[1] in {"<<",">>"}:return a,ua
-        return max(a,b),ua if a>b else ub if b>a else ua or ub
+        left = self.result_type(node[2])
+        if kind=="binary" and node[1] in {"<<",">>"}:
+            return (32, False) if left[0] < 32 else left
+        return self.common_type(left, self.result_type(node[3]))
 
 
 @dataclass
@@ -443,12 +488,13 @@ class Preprocessor:
                 source_encoding=self.encoding
             else:
                 content,codec,origin=raw,inherited_codec or "cp1252","inherited" if inherited_codec else "default"
-                try:raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    if not inherited_codec and not re.search(rb"#\s*pragma\s+code_page\s*\(",raw):
-                        self.warn("RC_ENCODING",(path,1),"no BOM/code_page; interpreted legacy bytes as cp1252; override with --encoding")
-                else:
-                    if not inherited_codec and not raw.isascii():codec,origin="utf-8","detected_utf8"
+                if not inherited_codec:
+                    try:raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        if not re.search(rb"#\s*pragma\s+code_page\s*\(",raw):
+                            self.warn("RC_ENCODING",(path,1),"no BOM/code_page; interpreted legacy bytes as cp1252; override with --encoding")
+                    else:
+                        if not raw.isascii():codec,origin="utf-8","detected_utf8"
             default_codec=codec if self.encoding else "cp1252"
             fixed_source=isinstance(content,str)
             self.encodings.append({"file":str(path),"line":1,"encoding":codec,"origin":origin,

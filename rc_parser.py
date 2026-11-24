@@ -1,16 +1,15 @@
-"""Read RC projects directly in Python; normalize resource payloads in memory.
+"""Parse RC declarations into Python objects consumed directly by Qt exporters.
 
-No .res file is created or opened, and no compiler/SDK is consulted. The small
-in-memory payload encoders are adapters to the existing Qt exporters, not an
-external resource-compilation stage. Unknown resources retain source text and
-produce diagnostics instead of being treated as successfully converted.
+File resources and inline binary data retain byte buffers where needed.
+Unknown resources retain source text and produce diagnostics.
 """
 
 from dataclasses import replace
 import struct
 
 from RcToUI import ConversionError
-from mfc_rc import Resource
+from mfc_rc import ATOMS, NativeControl, Resource
+from rc_commands import MenuItem
 from rc_preprocessor import Preprocessor, Expression, lex, rc_text
 
 
@@ -37,17 +36,14 @@ MENU_FLAGS = {"GRAYED":1,"INACTIVE":2,"DISABLED":2,"CHECKED":8,"UNCHECKED":0,"EN
 ACCEL_FLAGS = {"VIRTKEY":1,"ASCII":0,"NOINVERT":2,"SHIFT":4,"CONTROL":8,"ALT":16}
 
 
-def packed(fmt,*values):
-    try:return struct.pack("<"+fmt,*values)
-    except (struct.error,OverflowError) as exc:raise ConversionError(f"resource integer is out of range: {exc}") from exc
+def bounded(value, bits, signed=False):
+    limit=1<<(bits-int(signed))
+    if not (-limit if signed else 0)<=value<limit:
+        raise ConversionError(f"resource integer {value} is out of range for {'signed' if signed else 'unsigned'} {bits} bits")
+    return value
 
 
-def zstring(value):
-    if isinstance(value,int):return packed("HH",0xffff,value&0xffff)
-    return str(value).encode("utf-16-le")+b"\0\0"
-
-
-def align(data):return data+b"\0"*((-len(data))%4)
+def ordinal(value):return value&0xffff if isinstance(value,int) else value
 
 
 def fields(tokens):
@@ -75,9 +71,6 @@ class Parser:
     def take(self):
         if self.pos>=len(self.tokens):raise ConversionError("unexpected end of resource script")
         token=self.tokens[self.pos];self.pos+=1;return token
-    def expect(self, value):
-        self.skip_newlines();token=self.take()
-        if token.text.upper()!=value:raise ConversionError(f"expected {value}, found {token.text!r}")
     def begin(self):
         self.skip_newlines()
         if self.peek().upper() not in {"BEGIN","{"}:raise ConversionError("expected BEGIN/{")
@@ -135,11 +128,11 @@ class Parser:
                      resource_type=self.context.get("type") if resource_type is None else resource_type)
         self.pp.warnings[-1]["resource_line"]=token.line if resource_type=="STRINGTABLE_ENTRY" else self.context.get("line",token.line)
 
-    def add(self, kind, name, language, data, token, source_format="normalized"):
+    def add(self, kind, name, language, data, token, source_format="parsed", ribbon=None):
         self.failure_token=token
         if any(r.type==kind and r.name==name and r.language==language for r in self.resources):
             raise ConversionError(f"duplicate resource type={kind!r}, ID={name!r}, language={language:#x}")
-        self.resources.append(Resource(kind,name,language,data))
+        self.resources.append(Resource(kind,name,language,data,ribbon))
         self.origins.append({"type":kind,"name":name,"language":language,"file":token.path,"line":token.line,"format":source_format})
 
     def optional(self, language, initial=()):
@@ -168,7 +161,7 @@ class Parser:
     def dialog(self, name, extended, header, token):
         values=fields(header)
         if not 4<=len(values)<=(5 if extended else 4):raise ConversionError("dialog requires x,y,width,height and optional DIALOGEX help ID")
-        rect=[self.integer(value) for value in values[:4]]
+        rect=tuple(bounded(self.integer(value),16,True) for value in values[:4])
         if min(rect[2:])<0:raise ConversionError("dialog width/height cannot be negative")
         options=self.optional(self.language);self.begin()
         style=self.style(options.get("STYLE",[]),0x80880000 if "STYLE" not in options else 0)
@@ -187,23 +180,19 @@ class Parser:
             style|=0x40
         elif style&0x40:
             raise ConversionError("DS_SETFONT/DS_SHELLFONT requires a FONT declaration")
-        menu=self.identifier(options["MENU"]) if "MENU" in options else ""
-        native=self.identifier(options["CLASS"]) if "CLASS" in options else ""
+        menu=ordinal(self.identifier(options["MENU"])) if "MENU" in options else ""
+        native=ordinal(self.identifier(options["CLASS"])) if "CLASS" in options else ""
         help_id=self.integer(values[4],0) if len(values)>4 else 0
         items=[]
         while not self.ended():
             control=self.statement()
             if not control:raise ConversionError("empty or malformed dialog control")
             items.append(self.control(control,extended))
-        if extended:payload=packed("HHIIIHhhhh",1,0xffff,help_id&0xffffffff,exstyle,style,len(items),*rect)
-        else:payload=packed("IIHhhhh",style,exstyle,len(items),*rect)
-        payload+=zstring(menu)+zstring(native)+zstring(title)
-        if font:
-            payload+=packed("H",font[0])
-            if extended:payload+=packed("HBB",*font[2:])
-            payload+=zstring(font[1])
-        for item in items:payload=align(payload)+item
-        self.add(5,name,options["language"],payload,token)
+        bounded(len(items),16)
+        dialog=NativeControl("",name,native,title,rect,style,exstyle,help_id&0xffffffff,
+                             kind="DIALOGEX" if extended else "DIALOG",font=font or (),
+                             menu=menu,language=options["language"],children=items)
+        self.add(5,name,options["language"],dialog,token)
 
     def control(self, tokens, extended):
         kind=tokens[0].text.upper();values=fields(tokens[1:]);title=""
@@ -225,21 +214,23 @@ class Parser:
             identifier=self.integer(values[0]);geometry=values[1:5]
             style=self.style(values[5] if len(values)>5 else [],0x50000000|default)
             extra=values[6:]
-        rect=[self.integer(value) for value in geometry]
+        rect=tuple(bounded(self.integer(value),16,True) for value in geometry)
         if min(rect[2:])<0:raise ConversionError("control width/height cannot be negative")
         exstyle=self.style(extra[0]) if extra else 0
         help_id=self.integer(extra[1],0) if len(extra)>1 else 0
         self.skip_newlines();creation=b""
         if self.peek().upper() in {"BEGIN","{"}:creation=self.raw_data()
-        if extended:payload=packed("IIIhhhhI",help_id&0xffffffff,exstyle,style,*rect,identifier&0xffffffff)
-        else:payload=packed("IIhhhhH",style,exstyle,*rect,identifier&0xffff)
-        payload+=zstring(native)+zstring(title)
-        payload+=packed("H",len(creation)+(2 if creation and not extended else 0))+creation
-        return payload
+        bounded(len(creation)+(2 if creation and not extended else 0),16)
+        identifier&=0xffffffff if extended else 0xffff
+        if identifier in {0xffff,0xffffffff}:identifier=-1
+        native=ordinal(native)
+        return NativeControl("",identifier,ATOMS.get(native,native),ordinal(title),rect,style,exstyle,
+                             help_id&0xffffffff if extended else 0,creation)
 
     def menu(self, name, extended, token, header=()):
         options=self.optional(self.language,header)
-        def level():
+        def level(depth=0):
+            if depth>128:raise ConversionError("menu nesting exceeds 128 levels")
             self.begin();items=[]
             while not self.ended():
                 line=self.statement()
@@ -248,53 +239,44 @@ class Parser:
                 if kind not in {"POPUP","MENUITEM"}:raise ConversionError(f"unsupported menu statement {kind!r}")
                 popup=kind=="POPUP"
                 if not popup and len(parts)==1 and len(parts[0])==1 and parts[0][0].text.upper()=="SEPARATOR":
-                    items.append((False,"",0,0x800,0,0,[]));continue
+                    items.append(MenuItem(0,"",0x800,0));continue
                 label=rc_text(parts[0]);command=0;item_type=0;state=0;help_id=0
                 if extended:
-                    command=self.integer(parts[1],0) if len(parts)>1 else 0
-                    item_type=self.integer(parts[2],0) if len(parts)>2 else 0
-                    state=self.integer(parts[3],0) if len(parts)>3 else 0
-                    help_id=self.integer(parts[4],0) if len(parts)>4 else 0
+                    command=bounded(self.integer(parts[1],0),32) if len(parts)>1 else 0
+                    item_type=bounded(self.integer(parts[2],0),32) if len(parts)>2 else 0
+                    state=bounded(self.integer(parts[3],0),32) if len(parts)>3 else 0
+                    help_id=bounded(self.integer(parts[4],0),32) if popup and len(parts)>4 else 0
                 else:
                     start=1 if popup else 2
-                    if not popup:command=self.integer(parts[1]) if len(parts)>1 else 0
+                    if not popup:command=bounded(self.integer(parts[1]),16) if len(parts)>1 else 0
                     flags=0
                     for part in parts[start:]:flags|=self.integer(part,0,MENU_FLAGS)
-                    state=flags&(3|8|0x1000);item_type=flags&~(3|8|0x1000)
-                children=level() if popup else []
+                    bounded(flags,16)
+                    state=flags&(3|8|0x1000);item_type=flags&~(0x10|0x80|3|8|0x1000)
+                children=level(depth+1) if popup else []
                 if popup and not children:
                     self.warn("RC_EMPTY_MENU",line[0],"empty popup retained with a separator placeholder")
-                    children=[(False,"",0,0x800,0,0,[])]
-                items.append((popup,label,command,item_type,state,help_id,children))
+                    children=[MenuItem(0,"",0x800,0)]
+                if not popup and not command and not label:item_type|=0x800
+                items.append(MenuItem(command,label,item_type,state,help_id,popup,children))
             return items
         items=level()
-        payload=packed("HHI",1,4,0) if extended else packed("HH",0,0)
-        def encode(items,data):
-            for index,(popup,label,command,item_type,state,help_id,children) in enumerate(items):
-                end=0x80 if index==len(items)-1 else 0
-                if extended:
-                    data=align(data)+packed("IIIH",item_type,state,command,(1 if popup else 0)|end)+zstring(label)
-                    if popup:data=align(data)+packed("I",help_id)
-                else:
-                    data+=packed("H",item_type|state|(0x10 if popup else 0)|end)
-                    if not popup:data+=packed("H",command)
-                    data+=zstring(label)
-                if popup:data=encode(children,data)
-            return data
-        self.add(4,name,options["language"],encode(items,payload),token)
+        self.add(4,name,options["language"],{"version":int(extended),"help_id":0,"items":items},token)
 
     def toolbar(self,name,header,token):
         dimensions=fields(header)
         if len(dimensions)!=2:raise ConversionError("TOOLBAR requires width,height")
-        width,height=[self.integer(value) for value in dimensions]
+        width,height=[bounded(self.integer(value),16) for value in dimensions]
+        if not width or not height:raise ConversionError("toolbar icon dimensions must be positive")
         options=self.optional(self.language);self.begin();items=[]
         while not self.ended():
             line=self.statement()
             if not line:raise ConversionError("malformed toolbar item")
             if line[0].text.upper()=="SEPARATOR":items.append(0)
-            elif line[0].text.upper()=="BUTTON":items.append(self.integer(line[1:]))
+            elif line[0].text.upper()=="BUTTON":items.append(bounded(self.integer(line[1:]),16))
             else:raise ConversionError("TOOLBAR expects BUTTON or SEPARATOR")
-        self.add(241,name,options["language"],packed("HHHH",1,width,height,len(items))+packed("H"*len(items),*items),token)
+        bounded(len(items),16)
+        self.add(241,name,options["language"],{"width":width,"height":height,"items":items},token)
 
     def accelerators(self,name,token,header=()):
         options=self.optional(self.language,header);self.begin();items=[]
@@ -309,9 +291,12 @@ class Parser:
             else:key=self.integer(parts[0])
             flags=0
             for part in parts[2:]:flags|=self.integer(part,0,ACCEL_FLAGS)
-            items.append((flags,key,self.integer(parts[1])))
-        payload=b"".join(packed("HHHH",flags|(0x80 if index==len(items)-1 else 0),key,command,0) for index,(flags,key,command) in enumerate(items))
-        self.add(9,name,options["language"],payload,token)
+            items.append({"flags":bounded(flags,16),"key":bounded(key,16),"command":bounded(self.integer(parts[1]),16)})
+        for index,item in enumerate(items):
+            if item["flags"]&~0x9f or item["flags"]&0x80 and index!=len(items)-1:
+                raise ConversionError("invalid accelerator flags")
+        if items:items[-1]["flags"]|=0x80
+        self.add(9,name,options["language"],items,token)
 
     def strings(self,token,header=()):
         options=self.optional(self.language,header);self.begin()
@@ -327,7 +312,8 @@ class Parser:
                 if prefix and prefix[-1].text==",":prefix=prefix[:-1]
                 identifier=self.integer(prefix)
                 if not 0<=identifier<=0xffff:raise ConversionError("STRINGTABLE ID exceeds 16 bits")
-                value=rc_text(line[index:]);key=(identifier//16+1,options["language"])
+                value=rc_text(line[index:]);bounded(len(value.encode("utf-16-le"))//2,16)
+                key=(identifier//16+1,options["language"])
                 block=self.string_blocks.setdefault(key,{})
                 if identifier%16 in block:raise ConversionError(f"duplicate string ID {identifier}")
                 block[identifier%16]=(value,token)
@@ -349,7 +335,7 @@ class Parser:
                 else:
                     number=self.integer(value)
                     long=any(t.kind=="number" and "l" in t.text.lower() for t in value)
-                    data.extend(packed("I" if long else "H",number&(0xffffffff if long else 0xffff)))
+                    data.extend(struct.pack("<I" if long else "<H",number&(0xffffffff if long else 0xffff)))
         return bytes(data)
 
     def asset(self,kind,name,header,token):
@@ -373,22 +359,25 @@ class Parser:
             expected=14+header_size+masks+4*(colors or (1<<bits if bits<=8 else 0))
             if offset<expected:raise ConversionError(f"BMP pixel offset overlaps its header/palette in {path}")
             data=data[14:expected]+data[offset:]  # Normalize a legal gap before pixels.
-            decode_dib(data)  # Validate even an image not used by a control.
+            decode_dib(data, validate_only=True)  # Validate even an unused image.
         elif kind==14:
             if len(data)<6:raise ConversionError("truncated ICO header")
             reserved,icon_type,count=struct.unpack_from("<HHH",data)
             if reserved or icon_type!=1 or len(data)<6+count*16:raise ConversionError("invalid ICO directory")
-            group=packed("HHH",0,1,count)
+            group=[]
             for index in range(count):
                 w,h,colors,zero,planes,bits,size,offset=struct.unpack_from("<BBBBHHII",data,6+16*index)
                 if offset+size>len(data):raise ConversionError("ICO image is truncated")
                 identifier=self.icon_id;self.icon_id+=1
                 self.add(3,identifier,self.language,data[offset:offset+size],token,"file")
-                group+=packed("BBBBHHIH",w,h,colors,zero,planes,bits,size,identifier)
+                group.append((w,h,colors,zero,planes,bits,size,identifier))
             data=group
+        if kind==6:
+            from rc_commands import parse_string_block
+            data=parse_string_block(Resource(kind,name,self.language,data))
         from mfc_ribbon import is_ribbon, xml_root
-        if is_ribbon(Resource(kind,name,self.language,data)):xml_root(data)
-        self.add(kind,name,self.language,data,token,"file")
+        ribbon=xml_root(data) if is_ribbon(Resource(kind,name,self.language,data)) else None
+        self.add(kind,name,self.language,data,token,"file",ribbon)
 
     def recover(self,start,block):
         cursor=start;depth=0;found=False
@@ -446,11 +435,8 @@ class Parser:
                 self.warn("RC_PARSE",self.failure_token or token,str(exc),severity="error");self.recover(start,block)
                 self.unparsed.append({"file":token.path,"line":token.line,"error":str(exc),"source":" ".join(t.text for t in self.tokens[start:self.pos])})
         for (name,language),values in sorted(self.string_blocks.items()):
-            payload=b""
-            for index in range(16):
-                value=values.get(index,("",None))[0].encode("utf-16-le")
-                payload+=packed("H",len(value)//2)+value
-            self.add(6,name,language,payload,next(iter(values.values()))[1])
+            strings={(name-1)*16+index:value for index,(value,_) in values.items() if value}
+            self.add(6,name,language,strings,next(iter(values.values()))[1])
         return self.resources
 
 

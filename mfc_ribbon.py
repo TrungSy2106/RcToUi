@@ -19,8 +19,9 @@ import struct
 import zlib
 import xml.etree.ElementTree as ET
 
-from mfc_rc import ConversionError, Resource, conversion_decision, prop, safe_name
-from rc_commands import decode_dib, png_crop
+from mfc_rc import (ConversionError, Resource, conversion_decision, prop, safe_name,
+                    set_icon, set_size)
+from rc_commands import png_crop
 
 
 RIBBON_TYPES = {28, "28", "RT_RIBBON_XML", "RIBBON_XML"}
@@ -113,8 +114,7 @@ def xml_symbols(roots):
 
 def standalone(path, language=0):
     data = Path(path).read_bytes()
-    xml_root(data)
-    return Resource(28, safe_name(Path(path).stem), language, data)
+    return Resource(28, safe_name(Path(path).stem), language, data, xml_root(data))
 
 
 def png_pixels(data):
@@ -145,7 +145,7 @@ def png_pixels(data):
         elif kind == b"IEND":
             ended = True
             break
-        elif kind[:1].isupper() and kind not in {b"IHDR"}:
+        elif kind[:1].isupper():
             raise ConversionError(f"unsupported Ribbon PNG critical chunk {kind!r}")
         position += size + 12
     if header is None or not ended:
@@ -219,8 +219,8 @@ class Ribbon:
 
 
 class RibbonResources:
-    def __init__(self, resources, symbols, name_for, assets, warn, language=None, target=None):
-        self.assets, self.warn, self.name_for = assets, warn, name_for
+    def __init__(self, resources, symbols, assets, warn, language=None, target=None, xml_ids=None):
+        self.assets, self.warn = assets, warn
         self.frames, self.report, self.used_images = {}, [], set()
         self.names = {name: value for value, names in symbols.items() for name in names}
         self.image_cache = {}
@@ -234,7 +234,7 @@ class RibbonResources:
         for resource in resources:
             if not is_ribbon(resource) or language is not None and resource.language not in {0, language}:
                 continue
-            root, bar = xml_root(resource.data)
+            root, bar = resource.ribbon or xml_root(resource.data)
             ribbon = Ribbon(resource, root, bar, resource.name if target is None else target)
             key = (ribbon.target, resource.language)
             if key in self.frames:
@@ -242,7 +242,7 @@ class RibbonResources:
             self.frames[key] = ribbon
         if target is not None and not self.frames:
             raise ConversionError("--ribbon-target was specified but no Ribbon exists for the requested language")
-        for value, names in xml_symbols(ribbon.root for ribbon in self.frames.values()).items():
+        for value, names in (xml_ids if xml_ids is not None else xml_symbols(ribbon.root for ribbon in self.frames.values())).items():
             for name in names:
                 if name in self.names and self.names[name] != value:
                     warn("RIBBON_ID_MISMATCH", None, f"XML ID {name}={value} differs from compiled header ID {self.names[name]}; XML VALUE is retained.")
@@ -275,14 +275,15 @@ class RibbonResources:
             if key not in self.image_cache:
                 resource = self.assets.find(2, identifier, language)
                 if resource is None:
-                    choices = [r for r in self.assets.resources if r.name == identifier and r.data.startswith(b"\x89PNG\r\n\x1a\n")]
+                    choices = [r for r in self.assets.resources if r.name == identifier and isinstance(r.data, bytes)
+                               and r.data.startswith(b"\x89PNG\r\n\x1a\n")]
                     resource = next((r for r in choices if r.language == language), next((r for r in choices if r.language == 0), choices[0] if choices else None))
                 if resource is None:
                     raise ConversionError(f"image resource {identifier!r} is missing; provide --ribbon-resources for standalone XML")
-                pixels = png_pixels(resource.data) if resource.data.startswith(b"\x89PNG") else decode_dib(resource.data[14:] if resource.data.startswith(b"BM") else resource.data)
-                self.image_cache[key] = pixels
+                pixels = png_pixels(resource.data) if resource.data.startswith(b"\x89PNG") else self.assets.bitmap(resource)
+                self.image_cache[key] = (resource, pixels)
                 self.used_images.add((resource.type, resource.name, resource.language))
-            width, height, rgba = self.image_cache[key]
+            resource, (width, height, rgba) = self.image_cache[key]
             if index is None:
                 x, y, cell_width, cell_height = 0, 0, width, height
             else:
@@ -291,16 +292,12 @@ class RibbonResources:
                     raise ConversionError(f"image {identifier!r} size {width}x{height} is not divisible by cell size {size}")
                 columns = width // cell_width
                 x, y = index % columns * cell_width, index // columns * cell_height
-            data = png_crop(width, height, rgba, x, y, cell_width, cell_height)
+            data = resource.data if index is None and resource.data.startswith(b"\x89PNG") else png_crop(width, height, rgba, x, y, cell_width, cell_height)
             # Reuse exactly the same Assets/QRC inventory as classic toolbars.
-            filename = next((name for name, existing in self.assets.files.items()
-                             if name.endswith(".png") and existing == data), None)
-            if filename is None:
-                suffix = "whole" if index is None else str(index)
-                folder = self.assets.image_folder if index is None else self.assets.icon_folder
-                filename = f"{folder}/ribbon_{safe_name(identifier)}_{language:04x}_{cell_width}x{cell_height}_{suffix}.png"
-                self.assets.files[filename] = data
-            self.image_urls[image_key] = self.assets.url(filename)
+            suffix = "whole" if index is None else str(index)
+            folder = self.assets.image_folder if index is None else self.assets.icon_folder
+            filename = f"{folder}/ribbon_{safe_name(identifier)}_{language:04x}_{cell_width}x{cell_height}_{suffix}.png"
+            self.image_urls[image_key] = self.assets.add(filename, data)
             self.image_sizes[self.image_urls[image_key]] = (cell_width, cell_height)
             return self.image_urls[image_key]
         except (ConversionError, ValueError, struct.error, zlib.error) as exc:
@@ -363,8 +360,9 @@ class RibbonUi:
         return size
 
     def properties(self, widget, node, command=None):
+        # Optional fields may be absent on the new node; prop() replaces the others.
         for previous in list(widget.findall("property")):
-            if previous.get("name") in {"RcRibbonPath", "RcRibbonType", "RcRibbonProperties", "RcCommandId", "RcRibbonCommandName", "RcRibbonKeys"}:
+            if previous.get("name") in {"RcRibbonProperties", "RcCommandId", "RcRibbonCommandName", "RcRibbonKeys"}:
                 widget.remove(previous)
         prop(widget, "RcRibbonPath", "string", self.paths.get(id(node), node.tag), True)
         prop(widget, "RcRibbonType", "string", text(node, "ELEMENT_NAME", node.tag), True)
@@ -382,11 +380,11 @@ class RibbonUi:
         if text(node, "KEYS"):
             prop(widget, "RcRibbonKeys", "string", text(node, "KEYS"), True)
 
-    def layout(self, parent, kind="QVBoxLayout", prefix="ribbonLayout"):
+    def layout(self, parent, kind="QVBoxLayout", prefix="ribbonLayout", *, margin=2, spacing=2):
         layout = ET.SubElement(parent, "layout", {"class": kind, "name": self.builder.unique(prefix)})
         for key in ("leftMargin", "topMargin", "rightMargin", "bottomMargin"):
-            prop(layout, key, "number", 2)
-        prop(layout, "spacing", "number", 2)
+            prop(layout, key, "number", margin)
+        prop(layout, "spacing", "number", spacing)
         return layout
 
     @staticmethod
@@ -401,9 +399,7 @@ class RibbonUi:
         item = ET.SubElement(layout, "item")
         spacer = ET.SubElement(item, "spacer", name=self.builder.unique("ribbonSpacer"))
         prop(spacer, "orientation", "enum", "Qt::Horizontal" if horizontal else "Qt::Vertical")
-        size = prop(spacer, "sizeHint", "size", "")
-        ET.SubElement(size, "width").text = "1"
-        ET.SubElement(size, "height").text = "1"
+        set_size(spacer, 'sizeHint', '1', '1')
 
     def inherited_images(self, node, inherited):
         result = dict(inherited)
@@ -489,12 +485,10 @@ class RibbonUi:
             previous=widget.find("property[@name='"+key+"']")
             if previous is not None:
                 values[:]=[int(previous.findtext("size/width",str(values[0]))),int(previous.findtext("size/height",str(values[1])))]
-                widget.remove(previous)
             if width is not None:values[0]=width
             if height is not None:values[1]=height
             elif key=="minimumSize" and minimum_height is not None:values[1]=minimum_height
-            size=prop(widget,key,"size","")
-            ET.SubElement(size,"width").text=str(values[0]);ET.SubElement(size,"height").text=str(values[1])
+            set_size(widget, key, values[0], values[1])
 
     def popup_bar(self, parent, name):
         widget=ET.SubElement(parent,"widget",{"class":"QMenuBar","name":self.builder.unique(name)})
@@ -512,10 +506,9 @@ class RibbonUi:
         self.size_policy(button,horizontal="Maximum")
         self.properties(button,node,self.catalog.identifier(node)[0])
         if icon:
-            prop_icon=prop(button,"icon","iconset","");prop_icon.set("resource",self.catalog.assets.qrc_name)
-            ET.SubElement(prop_icon,"normaloff").text=icon
-            size=prop(button,"iconSize","size","")
-            for key,value in zip(("width","height"),self.catalog.image_sizes.get(icon, self.large_size if large else self.small_size)):ET.SubElement(size,key).text=str(value)
+            set_icon(button, self.catalog.assets.ui_qrc_name, icon)
+            width, height = self.catalog.image_sizes.get(icon, self.large_size if large else self.small_size)
+            set_size(button, "iconSize", width, height)
         if action:
             data=self.builder.actions[action]
             prop(button,"enabled","bool",not bool(data["state"]&3))
@@ -546,8 +539,7 @@ class RibbonUi:
             bar=self.popup_bar(parent,name)
             menu=self.menu(bar,node,inherited)
             if icon:
-                image=prop(bar.find("widget[@name='"+menu+"']"),"icon","iconset","")
-                image.set("resource",self.catalog.assets.qrc_name);ET.SubElement(image,"normaloff").text=icon
+                set_icon(bar.find("widget[@name='" + menu + "']"), self.catalog.assets.ui_qrc_name, icon)
             ET.SubElement(bar,"addaction",name=menu)
             return bar
         if not large and not popup:
@@ -557,8 +549,7 @@ class RibbonUi:
             return label
         wrapper=ET.SubElement(parent,"widget",{"class":"QWidget","name":self.builder.unique("ribbonLargeButton" if large else "ribbonSplitButton")})
         self.size_policy(wrapper,horizontal="Maximum")
-        layout=self.layout(wrapper,"QVBoxLayout" if large else "QHBoxLayout")
-        for value in layout.findall("property"):value.find("number").text="0"
+        layout=self.layout(wrapper,"QVBoxLayout" if large else "QHBoxLayout",margin=0,spacing=0)
         if main:
             item=ET.SubElement(layout,"item",alignment="Qt::AlignHCenter" if large else "Qt::AlignLeft")
             button=self.action_button(item,name,node,action,"" if large and icon else caption,icon,large)
@@ -577,33 +568,39 @@ class RibbonUi:
         menu = ET.SubElement(parent, "widget", {"class": "QMenu", "name": name})
         prop(menu, "title", "string", title if title is not None else text(node, "TEXT", text(node, "NAME", "File")))
         self.properties(menu, node)
+        for addition in self.menu_entries(menu, node, inherited):
+            ET.SubElement(menu, "addaction", name=addition)
+        return name
+
+    def menu_entries(self, menu, node, inherited, *, gallery=False):
+        """Build declared entries; a gallery emits its selectable items separately."""
+        prefix = "gallery_" if gallery else ""
         additions = []
         for child in node.findall("ELEMENTS/ELEMENT"):
             kind = text(child, "ELEMENT_NAME", "Button")
             if kind == "Separator":
                 additions.append("separator")
-                self.record(child, menu, placement="menu_separator")
+                self.record(child, menu, placement=prefix + "menu_separator")
             elif child.find("ELEMENTS/ELEMENT") is not None:
-                submenu = self.menu(menu, child, self.inherited_images(child, inherited))
+                images = inherited if gallery else self.inherited_images(child, inherited)
+                submenu = self.menu(menu, child, images)
                 additions.append(submenu)
-                self.record(child, menu.find(f"widget[@name='{submenu}']"), self.action(child, inherited), "submenu")
+                self.record(child, menu.find(f"widget[@name='{submenu}']"), self.action(child, inherited), prefix + "submenu")
             else:
                 action = self.action(child, inherited)
                 if action:
                     additions.append(action)
-                    self.record(child, menu, action, "menu")
-                elif kind == "Label":
+                    self.record(child, menu, action, prefix + "menu")
+                elif not gallery and kind == "Label":
                     label_action = self.builder.unique("ribbonMenuLabel")
                     element = ET.SubElement(self.builder.widget, "action", name=label_action)
                     prop(element, "text", "string", text(child, "TEXT"))
                     prop(element, "enabled", "bool", False)
                     additions.append(label_action)
                     self.record(child, element, label_action, "menu_label")
-                else:
+                elif not gallery:
                     self.warning(child, f"{kind} inside a dropdown requires a QWidgetAction; metadata is preserved.")
-        for addition in additions:
-            ET.SubElement(menu, "addaction", name=addition)
-        return name
+        return additions
 
     def record(self, node, widget, action=None, placement=None):
         command, command_name = self.catalog.identifier(node)
@@ -646,9 +643,7 @@ class RibbonUi:
             prop(widget, "textFormat", "enum", "Qt::PlainText")
         elif kind == "Group":
             widget = ET.SubElement(parent, "widget", {"class": "QWidget", "name": self.builder.unique("ribbonGroup")})
-            layout = self.layout(widget, "QVBoxLayout" if flag(node, "VERTICAL") else "QHBoxLayout")
-            for item in layout.findall("property"):
-                if item.get("name").endswith("Margin"):item.find("number").text="0"
+            layout = self.layout(widget, "QVBoxLayout" if flag(node, "VERTICAL") else "QHBoxLayout", margin=0)
             for child in node.findall("ELEMENTS/ELEMENT"):
                 self.element(ET.SubElement(layout, "item"), child, inherited)
         elif kind in {"Edit", "ComboBox", "ComboBox_Font", "Slider", "Progress"}:
@@ -658,9 +653,7 @@ class RibbonUi:
             if kind in {"Edit","ComboBox","ComboBox_Font"} and text(node,"TEXT"):
                 container=ET.SubElement(parent,"widget",{"class":"QWidget","name":self.builder.unique("ribbonField")})
                 self.size_policy(container,horizontal="Maximum")
-                field_layout=self.layout(container,"QHBoxLayout")
-                for item in field_layout.findall("property"):
-                    if item.get("name").endswith("Margin"):item.find("number").text="0"
+                field_layout=self.layout(container,"QHBoxLayout",margin=0)
                 label=ET.SubElement(ET.SubElement(field_layout,"item"),"widget",{"class":"QLabel","name":self.builder.unique("ribbonFieldLabel")})
                 prop(label,"text","string",text(node,"TEXT"))
                 prop(label,"textFormat","enum","Qt::PlainText")
@@ -712,7 +705,8 @@ class RibbonUi:
             layout = self.layout(widget, "QHBoxLayout")
             for child in node.findall("ELEMENTS/ELEMENT"):
                 self.element(ET.SubElement(layout, "item"), child, inherited)
-        self.properties(widget, node, self.catalog.identifier(node)[0])
+        if widget.find("property[@name='RcRibbonPath']") is None:
+            self.properties(widget, node, self.catalog.identifier(node)[0])
         for dimension in ("WIDTH", "HEIGHT"):
             value = number(text(node, dimension))
             if value is not None and value > 0:
@@ -758,11 +752,11 @@ class RibbonUi:
         if node.find("ELEMENTS/ELEMENT") is not None:
             wrapper = ET.SubElement(parent, "widget", {"class": "QWidget", "name": self.builder.unique("ribbonGalleryGroup")})
             layout = self.layout(wrapper)
-            self.gallery_list(ET.SubElement(layout, "item"), node, inherited, action)
+            self.gallery_list(ET.SubElement(layout, "item"), node, action)
             for child in node.findall("ELEMENTS/ELEMENT"):
                 self.element(ET.SubElement(layout, "item"), child, inherited)
             return wrapper
-        return self.gallery_list(parent, node, inherited, action)
+        return self.gallery_list(parent, node, action)
 
     def gallery_data(self, node):
         size_value = text(node, "SIZE_ICON")
@@ -775,7 +769,7 @@ class RibbonUi:
             identifier, _ = self.catalog.identifier(reference)
             pixels = self.catalog.image_cache.get((identifier, self.language))
             if first and pixels:
-                width, height, _ = pixels
+                _, (width, height, _) = pixels
                 paths = [self.catalog.image(reference, size, index, self.language) for index in range(width // size[0] * (height // size[1]))]
         labels = [item.text or "" for item in node.findall("ITEMS/ITEM")]
         return size, paths, labels
@@ -788,9 +782,7 @@ class RibbonUi:
         prop(menu, "title", "string", text(node, "TEXT"))
         image = self.icon(node, inherited, flag(node, "ALWAYS_LARGE"))
         if image:
-            icon = prop(menu, "icon", "iconset", "")
-            icon.set("resource", self.catalog.assets.qrc_name)
-            ET.SubElement(icon, "normaloff").text = image
+            set_icon(menu, self.catalog.assets.ui_qrc_name, image)
         group = ET.SubElement(self.builder.widget, "actiongroup", name=self.builder.unique("ribbonGallerySelection"))
         prop(group, "exclusive", "bool", True)
         additions = []
@@ -804,25 +796,11 @@ class RibbonUi:
             if command is not None:
                 prop(item, "RcCommandId", "string", command, True)
             if index < len(paths) and paths[index]:
-                icon = prop(item, "icon", "iconset", "")
-                icon.set("resource", self.catalog.assets.qrc_name)
-                ET.SubElement(icon, "normaloff").text = paths[index]
+                set_icon(item, self.catalog.assets.ui_qrc_name, paths[index])
             additions.append(item_name)
             if action:
                 self.builder.connect(item_name, "triggered()", action, "trigger()")
-        for child in node.findall("ELEMENTS/ELEMENT"):
-            if text(child, "ELEMENT_NAME") == "Separator":
-                additions.append("separator")
-                self.record(child, menu, placement="gallery_menu_separator")
-            elif child.find("ELEMENTS/ELEMENT") is not None:
-                submenu = self.menu(menu, child, inherited)
-                additions.append(submenu)
-                self.record(child, menu.find(f"widget[@name='{submenu}']"), self.action(child, inherited), "gallery_submenu")
-            else:
-                child_action = self.action(child, inherited)
-                if child_action:
-                    additions.append(child_action)
-                    self.record(child, menu, child_action, "gallery_menu")
+        additions.extend(self.menu_entries(menu, node, inherited, gallery=True))
         for item_name in additions:
             ET.SubElement(menu, "addaction", name=item_name)
         ET.SubElement(toolbar, "addaction", name=name)
@@ -832,7 +810,7 @@ class RibbonUi:
         self.warning(node, "Popup gallery preserves icons/items in a standard QMenu; native multi-column gallery layout is approximated.")
         return toolbar
 
-    def gallery_list(self, parent, node, inherited, action):
+    def gallery_list(self, parent, node, action):
         widget = ET.SubElement(parent, "widget", {"class": "QListWidget", "name": self.builder.unique("ribbonGallery")})
         prop(widget, "viewMode", "enum", "QListView::IconMode")
         prop(widget, "resizeMode", "enum", "QListView::Adjust")
@@ -841,17 +819,13 @@ class RibbonUi:
         size, paths, labels = self.gallery_data(node)
         self.size_policy(widget, "Ignored")
         self.bounds(widget,minimum_height=max(RIBBON_PANEL_ROWS * (self.small_size[1] + RIBBON_ROW_PADDING), size[1] + 14))
-        icon_size = prop(widget, "iconSize", "size", "")
-        ET.SubElement(icon_size, "width").text = str(size[0])
-        ET.SubElement(icon_size, "height").text = str(size[1])
+        set_size(widget, 'iconSize', size[0], size[1])
         for index in range(max(len(paths), len(labels))):
             item = ET.SubElement(widget, "item")
             if index < len(labels):
                 prop(item, "text", "string", labels[index])
             if index < len(paths) and paths[index]:
-                icon = prop(item, "icon", "iconset", "")
-                icon.set("resource", self.catalog.assets.qrc_name)
-                ET.SubElement(icon, "normaloff").text = paths[index]
+                set_icon(item, self.catalog.assets.ui_qrc_name, paths[index])
         if not paths and not labels:
             self.warning(node, "Gallery items are supplied at runtime; an empty QListWidget retains the command and source settings.")
         if action:
@@ -955,9 +929,7 @@ class RibbonUi:
             if main is not None:
                 image = self.icon(main, inherited, True)
                 if image:
-                    icon = prop(wrapper.find(f"widget[@name='{menu}']"), "icon", "iconset", "")
-                    icon.set("resource", self.catalog.assets.qrc_name)
-                    ET.SubElement(icon, "normaloff").text = image
+                    set_icon(wrapper.find(f"widget[@name='{menu}']"), self.catalog.assets.ui_qrc_name, image)
                 self.properties(wrapper, main, self.catalog.identifier(main)[0])
                 self.record(main, wrapper, placement="application")
             ET.SubElement(wrapper, "addaction", name=menu)
@@ -970,9 +942,7 @@ class RibbonUi:
             prop(toolbar, "movable", "bool", False)
             prop(toolbar, "floatable", "bool", False)
             prop(toolbar, "toolButtonStyle", "enum", "Qt::ToolButtonIconOnly")
-            icon_size=prop(toolbar,"iconSize","size","")
-            ET.SubElement(icon_size,"width").text=str(self.small_size[0])
-            ET.SubElement(icon_size,"height").text=str(self.small_size[1])
+            set_size(toolbar, 'iconSize', self.small_size[0], self.small_size[1])
             self.properties(toolbar, qat)
             self.size_policy(toolbar,horizontal="Maximum")
             for item in qat.findall("ITEMS/ITEM"):
@@ -1004,11 +974,7 @@ class RibbonUi:
         tabs = ET.SubElement(ET.SubElement(root_layout, "item"), "widget", {"class": "QTabWidget", "name": self.builder.unique("ribbonTabs")})
         prop(tabs, "documentMode", "bool", True)
         prop(tabs, "usesScrollButtons", "bool", True)
-        policy = prop(tabs, "sizePolicy", "sizepolicy", "")
-        policy.set("hsizetype", "Expanding")
-        policy.set("vsizetype", "Fixed")
-        ET.SubElement(policy, "horstretch").text = "0"
-        ET.SubElement(policy, "verstretch").text = "0"
+        self.size_policy(tabs)
         self.properties(tabs, bar)
         for category, context in self.categories():
             images = self.inherited_images(category, inherited)

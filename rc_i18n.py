@@ -5,7 +5,6 @@ and image contents must agree. Ambiguous forms stay separate and are reported.
 """
 
 from collections import Counter, defaultdict
-import hashlib
 import json
 import locale
 import posixpath
@@ -28,12 +27,14 @@ def preferred_language(languages, requested=None):
 
 
 class Form:
-    def __init__(self, data, images):
-        self.root = ET.fromstring(data)
-        self.paths, self.names, self.strings, self.signature = {}, {}, {}, {}
+    def __init__(self, root):
+        # Assets.add already gives identical image content the same QRC URL.
+        self.root = root
+        paths = {}
+        self.names, self.strings, self.signature = {}, {}, {}
 
         def walk(node, path):
-            self.paths[node] = path
+            paths[node] = path
             if node.tag in OBJECTS and node.get("name"):
                 self.names[node.get("name")] = path
             counts = Counter()
@@ -51,7 +52,7 @@ class Form:
         def snapshot(node, parent=None):
             if node.tag == "property" and node.get("name") in SOURCE_METADATA:
                 return None
-            path = self.paths[node]
+            path = paths[node]
             attributes = dict(node.attrib)
             if "name" in attributes and node.tag in OBJECTS | {"addaction"}:
                 attributes["name"] = self.names.get(attributes["name"], attributes["name"])
@@ -64,10 +65,7 @@ class Form:
                 value = json.dumps({k: v for k, v in values.items() if k not in RIBBON_TEXT}, sort_keys=True)
             elif node.tag in REFERENCES or node.tag == "cstring" and parent is not None and parent.get("name") == "buddy":
                 value = self.names.get(value, value)
-            elif node.tag in {"pixmap", "normaloff", "normalon", "disabledoff", "disabledon",
-                              "activeoff", "activeon", "selectedoff", "selectedon"}:
-                value = images.get(value, value)
-            children = tuple(self.paths[child] for child in node if snapshot(child, node))
+            children = tuple(paths[child] for child in node if snapshot(child, node))
             self.signature[path] = (node.tag, tuple(sorted(attributes.items())),
                                     value if not len(node) else value.strip(), children)
             return True
@@ -119,12 +117,11 @@ def remap_ribbon(value, names):
             remap_ribbon(child, names)
 
 
-def merge_ui_languages(outputs, dialogs, commands, assets, stem, *, separate=False, source_language=None):
+def merge_ui_languages(outputs, dialogs, commands, stem, *, separate=False, source_language=None):
     report = {"mode": "separate" if separate else "merge-compatible", "preferred_source_language": source_language,
               "merged_forms": [], "separate_forms": [], "ts_files": []}
     if separate:
         return report
-    images = {assets.url(path): hashlib.sha256(data).hexdigest() for path, data in assets.files.items()}
     families = defaultdict(list)
     for kind, records in (("dialog", dialogs), ("frame", commands.forms)):
         for record in records:
@@ -147,12 +144,12 @@ def merge_ui_languages(outputs, dialogs, commands, assets, stem, *, separate=Fal
             for record in records:
                 keep(record, kind, reason)
             continue
-        base = Form(outputs[base_record["file"]], images)
+        base = Form(outputs[base_record["file"]])
         compatible = [(base_record, base)]
         for record in records:
             if record is base_record:
                 continue
-            form = Form(outputs[record["file"]], images)
+            form = Form(outputs[record["file"]])
             reason = ambiguous_controls(record) or base.difference(form)
             if reason:
                 keep(record, kind, reason)
@@ -190,14 +187,15 @@ def merge_ui_languages(outputs, dialogs, commands, assets, stem, *, separate=Fal
             for control in record.get("controls", []):
                 control["name"] = names.get(control["name"], control["name"])
             remap_actions(record.get("actions", []), names)
-            for binding in commands.dialog_bindings:
-                if kind == "dialog" and binding["dialog"] == record["identifier"] and binding["language"] == record["language"]:
-                    remap_actions(binding["actions"], names)
-            if commands.ribbon is not None:
+            if kind == "dialog":
+                for binding in commands.dialog_bindings:
+                    if binding["dialog"] == record["identifier"] and binding["language"] == record["language"]:
+                        remap_actions(binding["actions"], names)
+            elif kind == "ribbon" and commands.ribbon is not None:
                 for ribbon in commands.ribbon.report:
-                    if kind == "ribbon" and ribbon["resource"] == record["ribbon"] and ribbon["language"] == record["language"]:
+                    if ribbon["resource"] == record["ribbon"] and ribbon["language"] == record["language"]:
                         remap_ribbon(ribbon, names)
-        outputs[destination] = serialize(base.root)
+        outputs[destination] = base.root
         report["merged_forms"].append(group)
 
     for language, contexts in sorted(catalogs.items()):

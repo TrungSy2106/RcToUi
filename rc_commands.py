@@ -12,7 +12,8 @@ import struct
 import zlib
 import xml.etree.ElementTree as ET
 
-from mfc_rc import ConversionError, Reader, conversion_decision, prop, safe_name, serialize
+from mfc_rc import (ConversionError, Reader, conversion_decision, prop, safe_name,
+                    serialize, set_icon, set_size, unique_name)
 
 
 @dataclass
@@ -24,51 +25,6 @@ class MenuItem:
     help_id: int = 0
     popup: bool = False
     children: list = field(default_factory=list)
-
-
-def parse_menu(resource):
-    reader = Reader(resource.data)
-    version, offset = reader.unpack("HH")
-    if version not in {0, 1} or version == 1 and offset < 4:
-        raise ConversionError(f"menu {resource.name}: unsupported header version/offset {version}/{offset}")
-    help_id = struct.unpack_from("<I", reader.data, 4)[0] if version == 1 and len(reader.data) >= 8 else 0
-    reader.take(offset)
-
-    def level(depth=0):
-        if depth > 128:
-            raise ConversionError(f"menu {resource.name}: nesting exceeds 128 levels")
-        items = []
-        while True:
-            if version:
-                reader.align()
-                item_type, state, command, flags = reader.unpack("IIIH")
-                popup = bool(flags & 1)
-            else:
-                flags = reader.word()
-                popup = bool(flags & 0x10)
-                command = 0 if popup else reader.word()
-                item_type, state = flags & ~(0x10 | 0x80 | 3 | 8 | 0x1000), flags & (3 | 8 | 0x1000)
-            text = reader.name()
-            if not isinstance(text, str):
-                raise ConversionError(f"menu {resource.name}: invalid UTF-16 text")
-            item_help = 0
-            children = []
-            if popup:
-                if version:
-                    reader.align()
-                    item_help = reader.unpack("I")[0]
-                children = level(depth + 1)
-            # Legacy MENU separators can be represented by an empty item ID 0.
-            if not popup and not command and not text:
-                item_type |= 0x800
-            items.append(MenuItem(command, text, item_type, state, item_help, popup, children))
-            if flags & 0x80:
-                return items
-
-    items = level() if reader.pos < len(reader.data) else []
-    if any(reader.data[reader.pos:]):
-        raise ConversionError(f"menu {resource.name}: unexpected trailing data")
-    return {"version": version, "help_id": help_id, "items": items}
 
 
 # Windows virtual-key values -> Qt PortableText key names. OEM punctuation is
@@ -87,25 +43,6 @@ VIRTUAL_KEYS.update({key: chr(key) for key in range(0x30, 0x3A)})
 VIRTUAL_KEYS.update({key: chr(key) for key in range(0x41, 0x5B)})
 VIRTUAL_KEYS.update({key: f"F{key - 0x6F}" for key in range(0x70, 0x88)})
 VIRTUAL_KEYS.update({key: f"Num+{key - 0x60}" for key in range(0x60, 0x6A)})
-
-
-def parse_accelerators(resource):
-    if len(resource.data) % 8:
-        raise ConversionError(f"accelerator {resource.name}: payload is not a sequence of 8-byte entries")
-    entries = []
-    reader = Reader(resource.data)
-    while reader.pos < len(reader.data):
-        flags, key, command, padding = reader.unpack("HHHH")
-        if padding or flags & ~0x9F:
-            raise ConversionError(f"accelerator {resource.name}: invalid flags/padding")
-        entries.append({"flags": flags, "key": key, "command": command})
-        if flags & 0x80:
-            if reader.pos != len(reader.data):
-                raise ConversionError(f"accelerator {resource.name}: data follows the final entry")
-            return entries
-    if entries:
-        raise ConversionError(f"accelerator {resource.name}: missing final-entry flag")
-    return entries
 
 
 def shortcut_text(entry):
@@ -134,17 +71,6 @@ def shortcut_text(entry):
     return "+".join([*modifiers, text])
 
 
-def parse_toolbar(resource):
-    reader = Reader(resource.data)
-    version, width, height, count = reader.unpack("HHHH")
-    if version != 1 or not width or not height:
-        raise ConversionError(f"toolbar {resource.name}: unsupported version or icon size")
-    items = list(reader.unpack("H" * count))
-    if any(reader.data[reader.pos:]):
-        raise ConversionError(f"toolbar {resource.name}: unexpected trailing data")
-    return {"width": width, "height": height, "items": items}
-
-
 def parse_string_block(resource):
     if not isinstance(resource.name, int) or not 1 <= resource.name <= 4096:
         raise ConversionError(f"string table: invalid block ID {resource.name!r}")
@@ -163,7 +89,7 @@ def parse_string_block(resource):
     return values
 
 
-def decode_dib(data):
+def decode_dib(data, *, validate_only=False):
     """Decode uncompressed Windows DIB strips without a Qt/Pillow dependency."""
     if len(data) < 40:
         raise ConversionError("truncated toolbar bitmap")
@@ -189,7 +115,10 @@ def decode_dib(data):
         palette.append((red, green, blue, 255))
     stride = ((width * bits + 31) // 32) * 4
     pixels = reader.take(stride * height)
-    rgba = bytearray(width * height * 4)
+    # Validation must also cover unused BMPs, without allocating/decoding RGBA.
+    if validate_only and (bits > 8 or len(palette) == 1 << bits):
+        return
+    rgba = None if validate_only else bytearray(width * height * 4)
 
     def channel(value, mask):
         if not mask:
@@ -206,6 +135,8 @@ def decode_dib(data):
                 index = row[x] if bits == 8 else (row[x // 2] >> (4 if x % 2 == 0 else 0)) & 15 if bits == 4 else (row[x // 8] >> (7 - x % 8)) & 1
                 if index >= len(palette):
                     raise ConversionError("toolbar bitmap references a missing palette color")
+                if validate_only:
+                    continue
                 color = palette[index]
             elif bits == 24:
                 blue, green, red = row[x * 3:x * 3 + 3]
@@ -219,7 +150,7 @@ def decode_dib(data):
                 color = (*color[:3], 0)
             offset = (y * width + x) * 4
             rgba[offset:offset + 4] = bytes(color)
-    return width, height, bytes(rgba)
+    return None if validate_only else (width, height, bytes(rgba))
 
 
 def png_crop(width, height, rgba, x, y, crop_width, crop_height):
@@ -236,7 +167,7 @@ def png_crop(width, height, rgba, x, y, crop_width, crop_height):
 
 class CommandResources:
     def __init__(self, resources, name_for, assets, warn, language=None):
-        self.resources, self.name_for, self.assets, self.warn = resources, name_for, assets, warn
+        self.name_for, self.assets, self.warn = name_for, assets, warn
         self.language = language
         self.ribbon = None
         self.menus, self.toolbars, self.accelerators = {}, {}, {}
@@ -249,16 +180,16 @@ class CommandResources:
                 continue
             key = (resource.name, resource.language)
             if resource.type == 4:
-                self.menus[key] = parse_menu(resource)
+                self.menus[key] = resource.data
                 value = {**self.menus[key], "items": [asdict(item) for item in self.menus[key]["items"]]}
             elif resource.type == 9:
-                self.accelerators[key] = parse_accelerators(resource)
+                self.accelerators[key] = resource.data
                 value = self.accelerators[key]
             elif resource.type == 241:
-                self.toolbars[key] = parse_toolbar(resource)
+                self.toolbars[key] = resource.data
                 value = self.toolbars[key]
             elif resource.type == 6:
-                value = parse_string_block(resource)
+                value = resource.data
                 duplicate = self.strings[resource.language].keys() & value.keys()
                 if duplicate:
                     raise ConversionError(f"duplicate string IDs in language {resource.language:#x}: {sorted(duplicate)}")
@@ -284,22 +215,16 @@ class CommandResources:
         if resource.language not in {0, language}:
             self.warn("TOOLBAR_BITMAP_LANGUAGE", None, f"Toolbar {identifier!r} uses bitmap language 0x{resource.language:04x}; verify the fallback.")
         try:
-            width, height, rgba = decode_dib(resource.data)
-            icons, pending, index = {}, {}, 0
-            existing = {data: name for name, data in self.assets.files.items() if name.endswith(".png")}
+            width, height, rgba = self.assets.bitmap(resource)
+            pending, index = [], 0
             for position, command in enumerate(toolbar["items"]):
                 if not command:
                     continue
                 data = png_crop(width, height, rgba, index * toolbar["width"], 0, toolbar["width"], toolbar["height"])
-                relative = existing.get(data)
-                if relative is None:
-                    relative = f"{self.assets.icon_folder}/toolbar_{safe_name(identifier)}_{language:04x}_{position}.png"
-                    pending[relative] = data
-                    existing[data] = relative
-                icons[position] = self.assets.url(relative)
+                relative = f"{self.assets.icon_folder}/toolbar_{safe_name(identifier)}_{language:04x}_{position}.png"
+                pending.append((position, relative, data))
                 index += 1
-            self.assets.files.update(pending)
-            return icons
+            return {position: self.assets.add(relative, data) for position, relative, data in pending}
         except (ConversionError, struct.error) as exc:
             self.warn("TOOLBAR_BITMAP_FORMAT", None, f"Toolbar {identifier!r}: {exc}")
             return {}
@@ -318,7 +243,7 @@ class CommandResources:
         keys = self.families()
         counts = Counter(identifier for identifier, _ in keys)
         outputs = {}
-        used = {name.lower() for name in reserved}
+        used = {name.rsplit("/",1)[-1].lower() for name in reserved}
         for identifier, language in keys:
             name = safe_name(self.name_for(identifier, "IDR_"))
             filename = name + (f"_{language:04x}" if counts[identifier] > 1 else "") + ".ui"
@@ -355,7 +280,8 @@ class CommandResources:
             if menu or toolbar:
                 ET.SubElement(window, "widget", {"class": "QStatusBar", "name": builder.unique("statusbar")})
             builder.finish()
-            outputs[filename] = serialize(root)
+            filename = f"ui/{'ribbons' if ribbon is not None else 'frames'}/{filename}"
+            outputs[filename] = root
             self.forms.append({"resource": identifier, "language": language, "file": filename,
                                "menu": menu is not None, "toolbar": toolbar is not None,
                                "accelerators": len(accelerators), "actions": builder.action_report(),
@@ -389,9 +315,7 @@ class CommandResources:
         source_rect = widget.find("property[@name='geometry']/rect")
         width, height = source_rect.findtext("width"), source_rect.findtext("height")
         for name in (("minimumSize", "maximumSize") if fixed else ("minimumSize",)):
-            size = prop(content, name, "size", "")
-            ET.SubElement(size, "width").text = width
-            ET.SubElement(size, "height").text = height
+            set_size(content, name, width, height)
         for source_child in source_children:
             widget.remove(source_child)
             content.append(source_child)
@@ -422,9 +346,9 @@ class CommandResources:
                   "languages": {f"0x{language:04x}": {str(identifier): value for identifier, value in sorted(values.items())}
                                 for language, values in sorted(self.strings.items())}}
         outputs = {safe_name(stem) + "_strings.json": (json.dumps(bundle, ensure_ascii=False, indent=2) + "\n").encode("utf-8")}
+        source_code = locale.windows_locale.get(source_language, "C")
         for language, values in sorted(self.strings.items()):
             code = locale.windows_locale.get(language, "C")
-            source_code = locale.windows_locale.get(source_language, "C")
             ts = ET.Element("TS", version="2.1", language=code, sourcelanguage=source_code)
             context = ET.SubElement(ts, "context")
             ET.SubElement(context, "name").text = bundle["context"]
@@ -480,12 +404,7 @@ class CommandUi:
         self.accelerator_keys = {}
 
     def unique(self, requested):
-        base, number = safe_name(requested), 2
-        name = base
-        while name in self.names:
-            name, number = f"{base}_{number}", number + 1
-        self.names.add(name)
-        return name
+        return unique_name(requested, self.names)
 
     def connect(self, sender, signal, receiver, slot):
         connections = self.root.find("connections")
@@ -578,9 +497,7 @@ class CommandUi:
         widget = ET.SubElement(parent, "widget", {"class": "QToolBar", "name": name})
         prop(widget, "windowTitle", "string", self.catalog.name_for(identifier, "IDR_"))
         prop(widget, "RcResourceId", "string", identifier, True)
-        size = prop(widget, "iconSize", "size", "")
-        ET.SubElement(size, "width").text = str(toolbar["width"])
-        ET.SubElement(size, "height").text = str(toolbar["height"])
+        set_size(widget, 'iconSize', toolbar['width'], toolbar['height'])
         for attribute_name, tag, value in (("toolBarArea", "enum", "TopToolBarArea"), ("toolBarBreak", "bool", "false")):
             attribute = ET.SubElement(widget, "attribute", name=attribute_name)
             ET.SubElement(attribute, tag).text = value
@@ -631,18 +548,13 @@ class CommandUi:
             if help_text is not None:
                 prop(element, "RcStringTableText", "string", help_text, True)
             if name in self.icons:
-                icon = prop(element, "icon", "iconset", "")
-                icon.set("resource", self.catalog.assets.qrc_name)
-                ET.SubElement(icon, "normaloff").text = self.icons[name]
+                set_icon(element, self.catalog.assets.ui_qrc_name, self.icons[name])
             prop(element, "RcCommandId", "string", command, True)
             prop(element, "RcMenuType", "string", item_type, True)
             prop(element, "RcMenuState", "string", state, True)
             if action["caption"] is not None:
                 prop(element, "RcMenuText", "string", action["caption"], True)
             for property_name, (tag, value, dynamic) in action.get("ribbon_properties", {}).items():
-                for previous in list(element.findall("property")):
-                    if previous.get("name") == property_name:
-                        element.remove(previous)
                 prop(element, property_name, tag, value, dynamic)
             # Explicitly associate actions with the window, including commands
             # used only by an accelerator table.
@@ -650,8 +562,6 @@ class CommandUi:
             ET.SubElement(self.widget, "addaction", name=name)
         for sender, receiver in self.aliases:
             self.connect(sender, "triggered()", receiver, "trigger()")
-        if self.catalog.assets.files and self.root.find("resources") is None:
-            ET.SubElement(ET.SubElement(self.root, "resources"), "include", location=self.catalog.assets.qrc_name)
 
     def action_report(self):
         return [{**action, "shortcuts": self.accelerators.get(name, []),

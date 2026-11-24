@@ -1,11 +1,7 @@
-"""Qt exporters for resources normalized in memory by the Python RC parser.
-
-In-memory formats: Microsoft DLGTEMPLATE, DLGTEMPLATEEX,
-DLGITEMTEMPLATE, DLGITEMTEMPLATEEX and MFC DLGINIT.
-"""
+"""Export parsed RC objects to Qt; read binary source resources when needed."""
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import base64
 import codecs
@@ -28,6 +24,7 @@ STANDARD_IDS = {1: "IDOK", 2: "IDCANCEL", 3: "IDABORT", 4: "IDRETRY",
                 5: "IDIGNORE", 6: "IDYES", 7: "IDNO", 8: "IDCLOSE", 9: "IDHELP"}
 STATIC_ICON_SIZE = (32, 32)  # SS_ICON system-large size in 96-DPI logical pixels.
 SS_REALSIZECONTROL, SS_CENTERIMAGE, SS_REALSIZEIMAGE = 0x40, 0x200, 0x800
+INVALID_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def conversion_decision(property, value, origin, reason):
@@ -64,29 +61,13 @@ class Reader:
     def word(self):
         return self.unpack("H")[0]
 
-    def align(self):
-        self.take((-self.pos) % 4)
-
-    def name(self):
-        first = self.word()
-        if first == 0xFFFF:
-            return self.word()
-        words = []
-        while first:
-            words.append(first)
-            first = self.word()
-        try:
-            return struct.pack("<" + "H" * len(words), *words).decode("utf-16-le")
-        except UnicodeDecodeError as exc:
-            raise ConversionError(f"invalid UTF-16 in resource at byte {self.pos}") from exc
-
-
 @dataclass
 class Resource:
     type: object
     name: object
     language: int
-    data: bytes
+    data: object
+    ribbon: object = None
 
 
 @dataclass
@@ -110,44 +91,6 @@ class NativeControl:
     language: int = 0
     menu: object = ""
     decisions: list = field(default_factory=list)
-
-
-def parse_template(resource, name_for):
-    reader = Reader(resource.data)
-    extended = resource.data[:4] == b"\x01\x00\xff\xff"
-    if extended:
-        _, _, help_id, exstyle, style, count, x, y, w, h = reader.unpack("HHIIIHhhhh")
-    else:
-        style, exstyle, count, x, y, w, h = reader.unpack("IIHhhhh")
-        help_id = 0
-    menu, native, title = reader.name(), reader.name(), reader.name()
-    if not isinstance(title, str):
-        raise ConversionError("dialog title must be a string")
-    dialog = NativeControl(name_for(resource.name, "IDD_"), resource.name, native,
-                           title, (x, y, w, h), style, exstyle, help_id,
-                           language=resource.language, menu=menu, kind="DIALOGEX" if extended else "DIALOG")
-    if style & 0x40:
-        pointsize = reader.word()
-        weight, italic, charset = reader.unpack("HBB") if extended else (400, 0, 1)
-        dialog.font = (pointsize, reader.name(), weight, italic, charset)
-    for _ in range(count):
-        reader.align()
-        if extended:
-            ch, ce, cs, cx, cy, cw, cheight, cid = reader.unpack("IIIhhhhI")
-        else:
-            cs, ce, cx, cy, cw, cheight, cid = reader.unpack("IIhhhhH")
-            ch = 0
-        native_class, text = reader.name(), reader.name()
-        extra_size = reader.word()
-        # Standard templates include the size WORD itself in creation-data size.
-        creation = reader.take(extra_size if extended else max(0, extra_size - 2))
-        native_class = ATOMS.get(native_class, native_class)
-        if cid in (0xFFFF, 0xFFFFFFFF):
-            cid = -1
-        control = NativeControl(name_for(cid, "IDC_"), cid, native_class, text,
-                                (cx, cy, cw, cheight), cs, ce, ch, creation)
-        dialog.children.append(control)
-    return dialog
 
 
 def windows_scale(dialog):
@@ -205,15 +148,29 @@ def safe_name(value):
     return "widget_" + name if not name or name[0].isdigit() else name
 
 
+def unique_name(requested, used):
+    base = safe_name(requested)
+    name, suffix = base, 2
+    while name in used:
+        name = f"{base}_{suffix}"
+        suffix += 1
+    used.add(name)
+    return name
+
+
 def prop(widget, name, tag, value, dynamic=False):
+    text = "true" if value is True else "false" if value is False else str(value)
+    if INVALID_XML.search(text):
+        raise ConversionError("resource contains text XML cannot represent")
+    previous = widget.find(f"property[@name='{name}']")
+    if previous is not None:widget.remove(previous)
     attributes = {"name": name}
     if dynamic:
         attributes["stdset"] = "0"
     item = ET.SubElement(widget, "property", attributes)
     child = ET.SubElement(item, tag)
-    if tag in {"string", "cstring"} and (dynamic or tag == "cstring"):
-        child.set("notr", "true") if tag == "string" else None
-    child.text = "true" if value is True else "false" if value is False else str(value)
+    if tag == "string" and dynamic:child.set("notr", "true")
+    child.text = text
     return child
 
 
@@ -225,6 +182,24 @@ def serialize(root):
     except ET.ParseError as exc:
         raise ConversionError(f"resource contains text XML cannot represent: {exc}") from exc
     return data
+
+
+def set_icon(widget, qrc, path):
+    icon = prop(widget, "icon", "iconset", "")
+    icon.set("resource", qrc)
+    ET.SubElement(icon, "normaloff").text = path
+
+
+def set_size(widget, name, width, height):
+    size = prop(widget, name, "size", "")
+    ET.SubElement(size, "width").text = str(width)
+    ET.SubElement(size, "height").text = str(height)
+
+
+def report_value(value):
+    if isinstance(value, bytes):
+        return {"data_base64": base64.b64encode(value).decode("ascii")}
+    return asdict(value)
 
 
 def map_control(control, warn, overrides):
@@ -246,8 +221,8 @@ def map_control(control, warn, overrides):
             setp("tristate", "bool", True)
         if control.qt_type == "QRadioButton":
             setp("autoExclusive", "bool", False)
-        if style & 0x8000 and control.qt_type != "QGroupBox":
-            setp("flat", "bool", True) if control.qt_type == "QPushButton" else None
+        if style & 0x8000 and control.qt_type == "QPushButton":
+            setp("flat", "bool", True)
         if button_type in {8, 11} or style & 0x1000:
             warn("BUTTON_CUSTOM_PAINT", control, "Owner-draw/pushlike button needs custom Qt painting or behavior.")
         if button_type >= 12:
@@ -297,8 +272,6 @@ def map_control(control, warn, overrides):
                 control.kind = "ICON" if static_type == 3 else "BITMAP"
             elif static_type not in {0, 1, 2, 11, 12}:
                 warn("STATIC_CUSTOM_PAINT", control, f"Static type {static_type} requires custom painting.")
-            if style & 0x80:
-                warn("STATIC_NOPREFIX", control, "SS_NOPREFIX uses literal ampersands; Qt text is escaped to retain them.")
     elif native == "combobox":
         control.qt_type, control.kind = "QComboBox", "COMBOBOX"
         setp("editable", "bool", style & 3 != 3)
@@ -433,11 +406,42 @@ class Assets:
         self.icon_folder = "assets/icons"
         self.image_folder = "assets/images"
         self.qrc_name = "resources.qrc"
+        self.ui_qrc_name = "../../" + self.qrc_name
         self.resource_prefix = "/rc/" + safe_name(stem)
         self.files = {}
+        self.contents = {}
+        self.bitmaps = {}
 
     def url(self, relative):
         return ":" + self.resource_prefix + "/" + relative
+
+    def add(self, relative, data):
+        key = (posixpath.splitext(relative)[1].lower(), data)
+        relative = self.contents.setdefault(key, relative)
+        self.files[relative] = data
+        return self.url(relative)
+
+    def bitmap(self, resource):
+        from rc_commands import decode_dib
+        data = resource.data[14:] if resource.data.startswith(b"BM") else resource.data
+        if data not in self.bitmaps:
+            self.bitmaps[data] = decode_dib(data)
+        return self.bitmaps[data]
+
+    def prune(self, outputs):
+        used = set()
+        for filename, root in outputs.items():
+            if not filename.endswith(".ui"):continue
+            nodes = list(root.iter())
+            used.update(node.text for node in nodes if node.text)
+            if any(node.get("resource") == self.ui_qrc_name for node in nodes):
+                resources = ET.Element("resources")
+                ET.SubElement(resources,"include",location=self.ui_qrc_name)
+                index = next((i for i,node in enumerate(root) if node.tag in {"connections","buttongroups"}),len(root))
+                root.insert(index,resources)
+        self.files = {name: data for name, data in self.files.items() if self.url(name) in used}
+        self.contents.clear()
+        self.bitmaps.clear()
 
     def find(self, resource_type, identifier, language):
         choices = [item for item in self.resources if item.type == resource_type and item.name == identifier]
@@ -463,13 +467,11 @@ class Assets:
         variant = ""
         try:
             if icon:
-                reader = Reader(resource.data)
-                reserved, image_type, count = reader.unpack("HHH")
-                if reserved or image_type != 1 or not count:
+                count = len(resource.data)
+                if not count:
                     raise ConversionError("invalid icon group")
                 images = []
-                for _ in range(count):
-                    width, height, colors, zero, planes, bits, size, image_id = reader.unpack("BBBBHHIH")
+                for width, height, colors, zero, planes, bits, size, image_id in resource.data:
                     image = self.find(3, image_id, resource.language)
                     if image is None or len(image.data) != size:
                         raise ConversionError(f"missing/truncated icon image {image_id}")
@@ -534,8 +536,7 @@ class Assets:
         # overwrite one another even when controls reference the same ICO.
         filename = f"{14 if icon else 2}_{safe_name(identifier)}_{resource.language:04x}{variant}.{extension}"
         relative = f"{self.icon_folder if icon else self.image_folder}/{filename}"
-        self.files[relative] = data
-        return self.url(relative)
+        return self.add(relative, data)
 
     def qrc(self):
         root = ET.Element("RCC")
@@ -558,9 +559,11 @@ def emit_dialog(dialog, scale, assets, warn, commands=None):
             # editor; retain full source dimensions in RcRectDlu.
             line = (dialog.font[0] * 96 / 72 if dialog.font else 13) + 8
             h = min(h * scale[1], line) / scale[1]
+        pixels = tuple(rounded(value) for value in (x * scale[0], y * scale[1], w * scale[0], h * scale[1]))
         rectangle = prop(parent, "geometry", "rect", "")
-        for key, value in zip(("x", "y", "width", "height"), (x * scale[0], y * scale[1], w * scale[0], h * scale[1])):
-            ET.SubElement(rectangle, key).text = str(rounded(value))
+        for key, value in zip(("x", "y", "width", "height"), pixels):
+            ET.SubElement(rectangle, key).text = str(value)
+        return rectangle, pixels[2:]
 
     def native_properties(parent, control):
         for name, value in (("RcId", control.numeric_id), ("RcClass", control.native_class),
@@ -608,9 +611,7 @@ def emit_dialog(dialog, scale, assets, warn, commands=None):
         prop(widget, "windowFlags", "set", "|".join(flags))
         if not dialog.style & 0x40000:
             for name in ("minimumSize", "maximumSize"):
-                size = prop(widget, name, "size", "")
-                ET.SubElement(size, "width").text = str(rounded(dialog.rect[2] * scale[0]))
-                ET.SubElement(size, "height").text = str(rounded(dialog.rect[3] * scale[1]))
+                set_size(widget, name, rounded(dialog.rect[2] * scale[0]), rounded(dialog.rect[3] * scale[1]))
     if dialog.menu:
         prop(widget, "RcMenu", "string", dialog.menu, True)
     if dialog.native_class:
@@ -622,29 +623,23 @@ def emit_dialog(dialog, scale, assets, warn, commands=None):
         if control.style & 0x20000:
             group_index += 1
         child = ET.SubElement(widget, "widget", {"class": control.qt_type, "name": control.name})
-        geometry(child, control, control.qt_type == "QComboBox" and control.style & 3 != 1)
+        rectangle, image_size = geometry(child, control, control.qt_type == "QComboBox" and control.style & 3 != 1)
         native_properties(child, control)
         for name, (tag, value) in control.properties.items():
             prop(child, name, tag, value)
-        rectangle = child.find("property[@name='geometry']/rect")
-        image_size = (int(rectangle.findtext("width")), int(rectangle.findtext("height")))
         image = assets.image(control, dialog.language, image_size)
         if image:
             if control.qt_type in {"QPushButton", "QCheckBox", "QRadioButton"}:
-                icon = prop(child, "icon", "iconset", "")
-                icon.set("resource", assets.qrc_name)
-                ET.SubElement(icon, "normaloff").text = image
+                set_icon(child, assets.ui_qrc_name, image)
             elif control.qt_type == "QLabel":
                 pixmap = prop(child, "pixmap", "pixmap", image)
-                pixmap.set("resource", assets.qrc_name)
+                pixmap.set("resource", assets.ui_qrc_name)
                 if control.kind == "ICON":
                     target = next(d["value"] for d in control.decisions if d["property"] == "icon_target_size")
                     centered = bool(control.style & SS_CENTERIMAGE)
                     fit = bool(control.style & SS_REALSIZECONTROL) and not centered
                     if not centered and not fit:
                         rectangle.find("width").text, rectangle.find("height").text = map(str, target)
-                    for previous in list(child.findall("property[@name='alignment']")):
-                        child.remove(previous)
                     prop(child, "alignment", "set", "Qt::AlignCenter" if centered else "Qt::AlignLeft|Qt::AlignTop")
                     prop(child, "scaledContents", "bool", not centered)
             else:
@@ -661,8 +656,6 @@ def emit_dialog(dialog, scale, assets, warn, commands=None):
             else:
                 text_property = "text"
                 dynamic = control.qt_type not in {"QLabel", "QPushButton", "QCheckBox", "QRadioButton", "QLineEdit"}
-            if control.qt_type == "QLabel" and control.style & 0x80 and control.kind != "LINK":
-                text = text.replace("&", "&&")
             prop(child, text_property, "string", text, dynamic)
         if control.qt_type == "QLabel" and isinstance(control.text, str) and "&" in control.text and not control.style & 0x80:
             buddy = next((item for item in dialog.children[index + 1:] if item.style & 0x10000), None)
@@ -684,9 +677,6 @@ def emit_dialog(dialog, scale, assets, warn, commands=None):
         tabs = ET.SubElement(root, "tabstops")
         for name in tabstops:
             ET.SubElement(tabs, "tabstop").text = name
-    if assets.files:
-        resources = ET.SubElement(root, "resources")
-        ET.SubElement(resources, "include", location=assets.qrc_name)
     if connections:
         connection_list = ET.SubElement(root, "connections")
         for sender, slot in connections:
@@ -700,26 +690,7 @@ def emit_dialog(dialog, scale, assets, warn, commands=None):
             prop(group, "exclusive", "bool", True)
     if dialog.menu and commands is not None:
         commands.attach_dialog(root, dialog)
-    return serialize(root)
-
-
-def organize_ui_outputs(outputs, dialogs, forms, qrc_name):
-    """Relocate UI files and make every QRC reference relative to its UI."""
-    ui_paths=[]
-    for records,default_folder in ((dialogs,"dialogs"),(forms,"frames")):
-        for record in records:
-            folder="ribbons" if record.get("ribbon") is not None else default_folder
-            old=record["file"]
-            relative=f"ui/{folder}/{old}"
-            root=ET.fromstring(outputs.pop(old))
-            qrc_relative=posixpath.relpath(qrc_name,posixpath.dirname(relative))
-            for node in root.iter():
-                if node.get("resource")==qrc_name:node.set("resource",qrc_relative)
-                if node.tag=="include" and node.get("location")==qrc_name:node.set("location",qrc_relative)
-            outputs[relative]=serialize(root)
-            record["file"]=relative
-            ui_paths.append(relative)
-    return ui_paths
+    return root
 
 
 def convert_mfc(rc_path, output_dir=None, encoding=None, *,
@@ -760,7 +731,7 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
         if not separator or not native or qt_type not in supported:
             raise ConversionError(f"invalid widget mapping {item!r}; use NATIVE=QT with a supported built-in widget")
         overrides[native.lower()] = qt_type
-    from mfc_ribbon import is_ribbon, standalone, xml_root, xml_symbols, RibbonResources
+    from mfc_ribbon import is_ribbon, standalone, xml_symbols, RibbonResources
     if ribbon_resources is not None and path.suffix.lower() != ".mfcribbon-ms":
         raise ConversionError("--ribbon-resources is only used with a standalone .mfcribbon-ms input")
     if path.suffix.lower() == ".mfcribbon-ms":
@@ -776,9 +747,9 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
     else:
         resources, symbols = load_script(path)
     known_names = {name: value for value, names in symbols.items() for name in names}
-    ribbon_roots = (xml_root(item.data)[0] for item in resources
-                    if is_ribbon(item) and (language is None or item.language in {0, language}))
-    for value, names in xml_symbols(ribbon_roots).items():
+    ribbon_ids = xml_symbols(item.ribbon[0] for item in resources
+                            if is_ribbon(item) and (language is None or item.language in {0, language}))
+    for value, names in ribbon_ids.items():
         for name in names:
             if name not in known_names or known_names[name] == value:
                 symbols.setdefault(value, [])
@@ -811,16 +782,17 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
     assets = Assets(resources, path.stem, warn)
     from rc_commands import CommandResources
     commands = CommandResources(resources, name_for, assets, warn, language)
-    ribbons = RibbonResources(resources, symbols, name_for, assets, warn, language, ribbon_target)
+    ribbons = RibbonResources(resources, symbols, assets, warn, language, ribbon_target, ribbon_ids)
     if ribbons.frames:
         commands.ribbon = ribbons
     selected = [item for item in resources if item.type == 5 and (language is None or item.language == language)]
     if not selected and not commands.families() and not commands.strings and not errors:
         errors.append(diagnostic("error","NO_RESOURCES",path,1,path.stem,"SOURCE",
                                  "no supported resources found for the requested language"))
-    dialogs = [parse_template(item, name_for) for item in selected]
+    dialogs = [item.data for item in selected]
     filenames, outputs, report_dialogs = set(), {}, []
     counts = Counter(item.numeric_id for item in dialogs)
+    font_scales = {}
     if dlginit_encoding is None:
         # DLGINIT byte strings are independent of the RC source's encoding.
         dlginit_encoding = "mbcs" if os.name == "nt" else "cp1252"
@@ -828,15 +800,9 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
     for active_resource, dialog in zip(selected, dialogs):
         used_names = set()
         for control in (dialog, *dialog.children):
-            base = safe_name(control.identifier)
-            name, suffix = base, 2
-            while name in used_names:
-                name, suffix = f"{base}_{suffix}", suffix + 1
-            used_names.add(name)
-            control.name = name
+            control.identifier = name_for(control.numeric_id, "IDD_" if control is dialog else "IDC_")
+            control.name = unique_name(control.identifier, used_names)
         for control in dialog.children:
-            if control.rect[2] < 0 or control.rect[3] < 0:
-                raise ConversionError(f"{dialog.identifier}/{control.identifier}: negative dimensions")
             map_control(control, warn, overrides)
         initializer = assets.find(240, dialog.numeric_id, dialog.language)
         if initializer:
@@ -844,7 +810,10 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
                 warn("DLGINIT_LANGUAGE", dialog, f"Using DLGINIT language 0x{initializer.language:04x}; verify language fallback.")
             read_dlginit(initializer, dialog, dlginit_encoding, warn)
         if scale is not None:factors=(scale,scale)
-        elif os.name=="nt":factors=windows_scale(dialog)
+        elif os.name=="nt":
+            key = (dialog.font, dialog.style & 0x48)
+            if key not in font_scales:font_scales[key] = windows_scale(dialog)
+            factors = font_scales[key]
         else:
             factors=(1.5,1.5)
             warn("RC_DLU_APPROXIMATION",dialog,"Windows font metrics are unavailable; DLU uses 1.5 logical pixels. Pass --scale to select a different factor.")
@@ -852,7 +821,7 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
             "user_override" if scale is not None else "platform_default" if os.name == "nt" else "approximation",
             "Explicit --scale." if scale is not None else "Windows font metrics at 96 DPI." if os.name == "nt" else
             "Windows font metrics are unavailable; a uniform scale is used."))
-        filename = safe_name(dialog.identifier) + (f"_{dialog.language:04x}" if counts[dialog.numeric_id] > 1 else "") + ".ui"
+        filename = "ui/dialogs/" + safe_name(dialog.identifier) + (f"_{dialog.language:04x}" if counts[dialog.numeric_id] > 1 else "") + ".ui"
         if filename.lower() in filenames:
             raise ConversionError(f"duplicate UI filename: {filename}")
         filenames.add(filename.lower())
@@ -871,11 +840,10 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
                                              "creation_data_hex": item.creation_data.hex(), "decisions": item.decisions} for item in dialog.children]})
     active_resource=None
     outputs.update(commands.export_frames(outputs))
-    ui_names = organize_ui_outputs(outputs,report_dialogs,commands.forms,assets.qrc_name)
     string_outputs = {"strings/"+name:data for name,data in commands.export_strings(path.stem, source_language).items()}
     outputs.update(string_outputs)
     from rc_i18n import merge_ui_languages
-    translations = merge_ui_languages(outputs, report_dialogs, commands, assets, path.stem,
+    translations = merge_ui_languages(outputs, report_dialogs, commands, path.stem,
                                      separate=separate_languages, source_language=source_language)
     ui_names = list(dict.fromkeys(record["file"] for record in report_dialogs + commands.forms))
     for variant in translations["separate_forms"]:
@@ -900,7 +868,8 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
                                                "Connect the primary QAction for each command ID; alternate menu labels and extra shortcuts forward trigger() to that action.",
                                                "Resource images use a generated QRC. Compile that QRC with Qt rcc/pyside6-rcc for application use."],
               "resources": [{"type": item.type, "name": item.name, "language": item.language,
-                             "data_base64": base64.b64encode(item.data).decode("ascii")} for item in resources]}
+                             **({"data_base64": base64.b64encode(item.data).decode("ascii")} if isinstance(item.data, bytes)
+                                else {"parsed": item.data})} for item in resources]}
     report["decision_origins"] = {
         "source": "Explicit RC/XML/image data or direct unit conversion.",
         "platform_default": "A Windows/MFC convention used when source data omits a value.",
@@ -929,11 +898,13 @@ def convert_mfc(rc_path, output_dir=None, encoding=None, *,
             if frame is not None:ribbon["file"]=frame["file"]
         report["ribbons"] = ribbons.report
     if source_metadata is not None:report["rc_project"]=source_metadata
+    assets.prune(outputs)
+    outputs = {name: serialize(data) if isinstance(data, ET.Element) else data for name, data in outputs.items()}
     outputs.update(assets.files)
     outputs[assets.qrc_name] = assets.qrc()
     report_name = "conversion_report.json"
     report["output_files"] = sorted([*outputs,report_name])
-    outputs[report_name] = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    outputs[report_name] = (json.dumps(report, ensure_ascii=False, indent=2, default=report_value) + "\n").encode("utf-8")
     destination = Path(output_dir).resolve() if output_dir else path.parent/(path.stem+"_qt")
     # No destination mutation occurs until parsing, serialization
     # and strict-mode checks have all succeeded.
